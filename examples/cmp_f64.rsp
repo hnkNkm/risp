@@ -1,4 +1,6 @@
 ; Comparison on f64 — verifies float comparison codegen.
+;;! stdout: ok: f64 cmp
+;;! exit: 0
 
 (defn abs64 [x: f64] -> f64
   (if (< x 0.0) (- 0.0 x) x))

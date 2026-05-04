@@ -1,4 +1,6 @@
 ; Hello World in Risp
+;;! stdout: Hello, Risp!
+;;! exit: 0
 
 (defn main [] -> i32
   (do

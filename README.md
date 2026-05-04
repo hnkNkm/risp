@@ -143,6 +143,20 @@ cargo risp run examples/hello.rsp
 cargo risp emit-llvm examples/hello.rsp
 ```
 
+## テスト
+
+```sh
+cargo test                  # unit + e2e
+cargo test --test examples  # e2e のみ（examples/*.rsp をビルド・実行・出力検証）
+```
+
+e2e テストは各 `examples/*.rsp` 先頭の `;;!` ヘッダで期待値を宣言する:
+
+```lisp
+;;! stdout: Hello, Risp!
+;;! exit: 0
+```
+
 ## 実装方針
 
 - パーサ: 手書き（S式は単純なので外部クレート不要）
@@ -177,7 +191,7 @@ cargo run -- run examples/hello.rsp
 - [x] 比較演算子の型伝播バグ修正（i64/floatでも動くように）
 - [x] ASTに型情報を埋め込む構造へリファクタ（`Expr.ty`）
 - [ ] エラー報告（行・列・ソース表示）
-- [ ] e2e テスト（`examples/` を実行して期待出力と比較）
+- [x] e2e テスト（`examples/` を実行して期待出力と比較）
 
 ### Phase 3 — 言語機能
 - [ ] 動的String（Rc or GC）

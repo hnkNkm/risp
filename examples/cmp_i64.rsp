@@ -1,4 +1,6 @@
 ; Comparison on i64 — verifies type propagation works for non-default int types.
+;;! stdout: ok: i64 cmp
+;;! exit: 0
 
 (defn max64 [a: i64, b: i64] -> i64
   (if (> a b) a b))
