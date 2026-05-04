@@ -1,0 +1,9 @@
+/target
+.direnv/
+.claude/
+result
+result-*
+
+# Build artifacts from .rsp examples
+*.o
+/hello

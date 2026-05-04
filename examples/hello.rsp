@@ -1,0 +1,6 @@
+; Hello World in Risp
+
+(defn main [] -> i32
+  (do
+    (println "Hello, Risp!")
+    0))

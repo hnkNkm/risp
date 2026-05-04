@@ -1,0 +1,15 @@
+[package]
+name = "risp"
+version = "0.1.0"
+edition = "2024"
+description = "A statically-typed, Lisp-like programming language with Rust-style types, compiled to native code via LLVM"
+license = "MIT"
+
+[[bin]]
+name = "risp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+inkwell = { version = "0.9", features = ["llvm18-1"] }
+thiserror = "2"
