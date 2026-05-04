@@ -1,0 +1,8 @@
+; Should error: undefined variable.
+;;! error_at: 7:14
+;;! error_contains: undefined variable
+
+(defn main [] -> i32
+  (do
+    (println missing)
+    0))

@@ -1,0 +1,6 @@
+; Should error: unterminated string literal.
+;;! error_at: 6:12
+;;! error_contains: unterminated string
+
+(defn main [] -> i32
+  (println "oops))

@@ -8,19 +8,34 @@ use thiserror::Error;
 #[allow(dead_code)] // some variants are placeholders for future checks
 pub enum TypeError {
     #[error("undefined variable {0:?}")]
-    UndefinedVar(String),
+    UndefinedVar(String, Span),
     #[error("undefined function {0:?}")]
-    UndefinedFn(String),
+    UndefinedFn(String, Span),
     #[error("type mismatch: expected {expected}, found {found}")]
-    Mismatch { expected: Type, found: Type },
+    Mismatch { expected: Type, found: Type, span: Span },
     #[error("arity mismatch for {name:?}: expected {expected}, got {got}")]
-    Arity { name: String, expected: usize, got: usize },
+    Arity { name: String, expected: usize, got: usize, span: Span },
     #[error("operator {op:?} cannot be applied to {ty}")]
-    BadOperand { op: String, ty: Type },
+    BadOperand { op: String, ty: Type, span: Span },
     #[error("integer literal does not fit type {0}")]
-    IntLitOverflow(Type),
+    IntLitOverflow(Type, Span),
     #[error("missing main function")]
     NoMain,
+}
+
+impl TypeError {
+    /// Returns the source span for this error, if it has one.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            TypeError::UndefinedVar(_, s)
+            | TypeError::UndefinedFn(_, s)
+            | TypeError::Mismatch { span: s, .. }
+            | TypeError::Arity { span: s, .. }
+            | TypeError::BadOperand { span: s, .. }
+            | TypeError::IntLitOverflow(_, s) => Some(*s),
+            TypeError::NoMain => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,10 +74,22 @@ impl TypeCk {
         // ensure main exists with signature `[] -> i32`
         match self.fns.get("main") {
             Some(sig) if sig.params.is_empty() && sig.ret == Type::I32 => {}
-            Some(_) => return Err(TypeError::Mismatch {
-                expected: Type::I32,
-                found: self.fns["main"].ret.clone(),
-            }),
+            Some(_) => {
+                // Find main's span for the diagnostic.
+                let main_span = prog
+                    .items
+                    .iter()
+                    .find_map(|it| match it {
+                        TopLevel::Function(f) if f.name == "main" => Some(f.span),
+                        _ => None,
+                    })
+                    .unwrap_or_else(Span::dummy);
+                return Err(TypeError::Mismatch {
+                    expected: Type::I32,
+                    found: self.fns["main"].ret.clone(),
+                    span: main_span,
+                });
+            }
             None => return Err(TypeError::NoMain),
         }
 
@@ -73,13 +100,15 @@ impl TypeCk {
                     for p in &f.params {
                         env.insert(p.name.clone(), p.ty.clone());
                     }
+                    let body_span = f.body.span;
                     let body_ty = self.check_expr(&mut f.body, &mut env)?;
-                    expect(&f.ret, &body_ty)?;
+                    expect(&f.ret, &body_ty, body_span)?;
                 }
                 TopLevel::Const(c) => {
                     let mut env = HashMap::new();
+                    let val_span = c.value.span;
                     let ty = self.check_expr(&mut c.value, &mut env)?;
-                    expect(&c.ty, &ty)?;
+                    expect(&c.ty, &ty, val_span)?;
                 }
             }
         }
@@ -87,6 +116,7 @@ impl TypeCk {
     }
 
     fn check_expr(&self, e: &mut Expr, env: &mut HashMap<String, Type>) -> Result<Type, TypeError> {
+        let span = e.span;
         let ty = match &mut e.kind {
             ExprKind::Lit(l) => lit_type(l),
             ExprKind::Var(name) => {
@@ -95,16 +125,18 @@ impl TypeCk {
                 } else if let Some(t) = self.consts.get(name) {
                     t.clone()
                 } else {
-                    return Err(TypeError::UndefinedVar(name.clone()));
+                    return Err(TypeError::UndefinedVar(name.clone(), span));
                 }
             }
             ExprKind::If { cond, then_branch, else_branch } => {
+                let cond_span = cond.span;
                 let ct = self.check_expr(cond, env)?;
-                expect(&Type::Bool, &ct)?;
+                expect(&Type::Bool, &ct, cond_span)?;
                 let tt = self.check_expr(then_branch, env)?;
+                let et_span = else_branch.span;
                 let et = self.check_expr(else_branch, env)?;
                 if tt != et {
-                    return Err(TypeError::Mismatch { expected: tt, found: et });
+                    return Err(TypeError::Mismatch { expected: tt, found: et, span: et_span });
                 }
                 tt
             }
@@ -114,8 +146,9 @@ impl TypeCk {
                     .map(|b| (b.name.clone(), env.get(&b.name).cloned()))
                     .collect();
                 for b in bindings.iter_mut() {
+                    let val_span = b.value.span;
                     let vt = self.check_expr(&mut b.value, env)?;
-                    expect(&b.ty, &vt)?;
+                    expect(&b.ty, &vt, val_span)?;
                     env.insert(b.name.clone(), b.ty.clone());
                 }
                 let bt = self.check_expr(body, env)?;
@@ -137,7 +170,7 @@ impl TypeCk {
             }
             ExprKind::Call { callee, args } => {
                 let callee = callee.clone();
-                self.check_call(&callee, args, env)?
+                self.check_call(&callee, args, env, span)?
             }
         };
         e.ty = Some(ty.clone());
@@ -149,61 +182,69 @@ impl TypeCk {
         callee: &str,
         args: &mut [Expr],
         env: &mut HashMap<String, Type>,
+        call_span: Span,
     ) -> Result<Type, TypeError> {
         // builtins first
         match callee {
             "+" | "-" | "*" | "/" | "mod" => {
                 if args.len() != 2 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
+                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len(), span: call_span });
                 }
+                let a_span = args[0].span;
                 let a = self.check_expr(&mut args[0], env)?;
+                let b_span = args[1].span;
                 let b = self.check_expr(&mut args[1], env)?;
                 if a != b {
-                    return Err(TypeError::Mismatch { expected: a, found: b });
+                    return Err(TypeError::Mismatch { expected: a, found: b, span: b_span });
                 }
                 if !is_numeric(&a) {
-                    return Err(TypeError::BadOperand { op: callee.into(), ty: a });
+                    return Err(TypeError::BadOperand { op: callee.into(), ty: a, span: a_span });
                 }
                 Ok(a)
             }
             "<" | "<=" | ">" | ">=" | "=" | "!=" => {
                 if args.len() != 2 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
+                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len(), span: call_span });
                 }
+                let a_span = args[0].span;
                 let a = self.check_expr(&mut args[0], env)?;
+                let b_span = args[1].span;
                 let b = self.check_expr(&mut args[1], env)?;
                 if a != b {
-                    return Err(TypeError::Mismatch { expected: a, found: b });
+                    return Err(TypeError::Mismatch { expected: a, found: b, span: b_span });
                 }
                 if !(is_numeric(&a) || a == Type::Bool) {
-                    return Err(TypeError::BadOperand { op: callee.into(), ty: a });
+                    return Err(TypeError::BadOperand { op: callee.into(), ty: a, span: a_span });
                 }
                 Ok(Type::Bool)
             }
             "and" | "or" => {
                 if args.len() != 2 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
+                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len(), span: call_span });
                 }
                 for a in args.iter_mut() {
+                    let s = a.span;
                     let t = self.check_expr(a, env)?;
-                    expect(&Type::Bool, &t)?;
+                    expect(&Type::Bool, &t, s)?;
                 }
                 Ok(Type::Bool)
             }
             "not" => {
                 if args.len() != 1 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len() });
+                    return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len(), span: call_span });
                 }
+                let s = args[0].span;
                 let t = self.check_expr(&mut args[0], env)?;
-                expect(&Type::Bool, &t)?;
+                expect(&Type::Bool, &t, s)?;
                 Ok(Type::Bool)
             }
             "print" | "println" => {
                 if args.len() != 1 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len() });
+                    return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len(), span: call_span });
                 }
+                let s = args[0].span;
                 let t = self.check_expr(&mut args[0], env)?;
-                expect(&Type::Str, &t)?;
+                expect(&Type::Str, &t, s)?;
                 Ok(Type::Unit)
             }
             // user-defined function
@@ -212,17 +253,19 @@ impl TypeCk {
                     .fns
                     .get(callee)
                     .cloned()
-                    .ok_or_else(|| TypeError::UndefinedFn(callee.to_string()))?;
+                    .ok_or_else(|| TypeError::UndefinedFn(callee.to_string(), call_span))?;
                 if sig.params.len() != args.len() {
                     return Err(TypeError::Arity {
                         name: callee.into(),
                         expected: sig.params.len(),
                         got: args.len(),
+                        span: call_span,
                     });
                 }
                 for (param_ty, arg) in sig.params.iter().zip(args.iter_mut()) {
+                    let s = arg.span;
                     let at = self.check_expr(arg, env)?;
-                    expect(param_ty, &at)?;
+                    expect(param_ty, &at, s)?;
                 }
                 Ok(sig.ret.clone())
             }
@@ -251,10 +294,10 @@ fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::I32 | Type::I64 | Type::F32 | Type::F64)
 }
 
-fn expect(expected: &Type, found: &Type) -> Result<(), TypeError> {
+fn expect(expected: &Type, found: &Type, span: Span) -> Result<(), TypeError> {
     if expected == found {
         Ok(())
     } else {
-        Err(TypeError::Mismatch { expected: expected.clone(), found: found.clone() })
+        Err(TypeError::Mismatch { expected: expected.clone(), found: found.clone(), span })
     }
 }

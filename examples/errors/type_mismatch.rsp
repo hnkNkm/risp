@@ -1,0 +1,7 @@
+; Should error: int literal defaults to i32, but binding asks for i64.
+;;! error_at: 6:16
+;;! error_contains: type mismatch
+
+(defn main [] -> i32
+  (let [x: i64 (+ 1 2)]
+    0))
