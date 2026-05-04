@@ -56,9 +56,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::EmitLlvm { input } => {
             let src = fs::read_to_string(&input)?;
-            let prog = parser::parse(&src)?;
+            let mut prog = parser::parse(&src)?;
             let mut tyck = typeck::TypeCk::new();
-            tyck.check(&prog)?;
+            tyck.check(&mut prog)?;
             let context = Context::create();
             let mod_name = input.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
             let mut cg = Codegen::new(&context, mod_name);
@@ -88,9 +88,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let src = fs::read_to_string(input)?;
-    let prog = parser::parse(&src)?;
+    let mut prog = parser::parse(&src)?;
     let mut tyck = typeck::TypeCk::new();
-    tyck.check(&prog)?;
+    tyck.check(&mut prog)?;
 
     let context = Context::create();
     let mod_name = input.file_stem().and_then(|s| s.to_str()).unwrap_or("main");

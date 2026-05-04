@@ -1,0 +1,11 @@
+; Comparison on f64 — verifies float comparison codegen.
+
+(defn abs64 [x: f64] -> f64
+  (if (< x 0.0) (- 0.0 x) x))
+
+(defn main [] -> i32
+  (let [a: f64 (abs64 -3.5)
+        b: f64 (abs64 2.0)]
+    (if (> a b)
+      (do (println "ok: f64 cmp") 0)
+      (do (println "FAIL: f64 cmp") 1))))

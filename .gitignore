@@ -7,3 +7,5 @@ result-*
 # Build artifacts from .rsp examples
 *.o
 /hello
+/cmp_i64
+/cmp_f64

@@ -18,8 +18,14 @@ Rustの型システムを持つLispライクなプログラミング言語。LLV
 最小限「LLVMでネイティブコンパイルして実行できる」ところまで動作。
 
 ```sh
-$ risp run examples/hello.rsp
+$ cargo risp run examples/hello.rsp
 Hello, Risp!
+
+$ cargo risp run examples/cmp_i64.rsp
+ok: i64 cmp
+
+$ cargo risp run examples/cmp_f64.rsp
+ok: f64 cmp
 ```
 
 生成物は本物の Mach-O / ELF 実行可能バイナリ（Rustランタイム不要）。
@@ -121,11 +127,20 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 
 ## CLI
 
+ビルド済みバイナリ (`./target/debug/risp` または `cargo install --path .` 後の `risp`):
+
 ```sh
 risp build hello.rsp        # ./hello を生成
 risp run   hello.rsp        # ビルドして実行
 risp emit-llvm hello.rsp    # LLVM IR を stdout に出力
 risp emit-ast  hello.rsp    # AST を dump（デバッグ用）
+```
+
+開発中は `cargo risp` エイリアス（`.cargo/config.toml` で定義）が便利:
+
+```sh
+cargo risp run examples/hello.rsp
+cargo risp emit-llvm examples/hello.rsp
 ```
 
 ## 実装方針
@@ -159,8 +174,8 @@ cargo run -- run examples/hello.rsp
 - [x] Hello World が動く
 
 ### Phase 2 — 短期改善
-- [ ] 比較演算子の型伝播バグ修正（i64/floatでも動くように）
-- [ ] ASTに型情報を埋め込む構造へリファクタ
+- [x] 比較演算子の型伝播バグ修正（i64/floatでも動くように）
+- [x] ASTに型情報を埋め込む構造へリファクタ（`Expr.ty`）
 - [ ] エラー報告（行・列・ソース表示）
 - [ ] e2e テスト（`examples/` を実行して期待出力と比較）
 
