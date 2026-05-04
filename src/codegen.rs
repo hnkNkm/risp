@@ -8,8 +8,8 @@ use inkwell::IntPredicate;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
-use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -49,7 +49,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub fn compile_program(&mut self, prog: &Program, tyck: &TypeCk) -> Result<(), CodegenError> {
+    pub fn compile_program(&mut self, prog: &Program, _tyck: &TypeCk) -> Result<(), CodegenError> {
         // declare external `puts(i8*) -> i32` for println
         let i32_ty = self.context.i32_type();
         let i8ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -86,7 +86,7 @@ impl<'ctx> Codegen<'ctx> {
         // emit function bodies
         for it in &prog.items {
             if let TopLevel::Function(f) = it {
-                self.emit_function(f, tyck)?;
+                self.emit_function(f)?;
             }
         }
 
@@ -107,7 +107,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn emit_function(&mut self, f: &Function, _tyck: &TypeCk) -> Result<(), CodegenError> {
+    fn emit_function(&mut self, f: &Function) -> Result<(), CodegenError> {
         let fv = self.fns[&f.name];
         let entry = self.context.append_basic_block(fv, "entry");
         self.builder.position_at_end(entry);
@@ -121,7 +121,7 @@ impl<'ctx> Codegen<'ctx> {
             self.locals.insert(p.name.clone(), (alloca, p.ty.clone()));
         }
 
-        let ret_val = self.emit_expr(&f.body, &f.ret)?;
+        let ret_val = self.emit_expr(&f.body)?;
 
         match (&f.ret, ret_val) {
             (Type::Unit, _) => {
@@ -157,12 +157,18 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn emit_expr(&mut self, e: &Expr, expected: &Type) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+    fn expr_ty(e: &Expr) -> Result<&Type, CodegenError> {
+        e.ty.as_ref()
+            .ok_or_else(|| CodegenError::Internal("expression missing type info (typeck not run?)".into()))
+    }
+
+    fn emit_expr(&mut self, e: &Expr) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        let ty = Self::expr_ty(e)?.clone();
         match &e.kind {
-            ExprKind::Lit(l) => Ok(Some(self.emit_lit(l, expected))),
+            ExprKind::Lit(l) => Ok(Some(self.emit_lit(l, &ty))),
             ExprKind::Var(name) => {
-                if let Some((ptr, ty)) = self.locals.get(name).cloned() {
-                    let bt = basic_type(self.context, &ty);
+                if let Some((ptr, vty)) = self.locals.get(name).cloned() {
+                    let bt = basic_type(self.context, &vty);
                     let v = self
                         .builder
                         .build_load(bt, ptr, name)
@@ -176,7 +182,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             ExprKind::If { cond, then_branch, else_branch } => {
                 let cv = self
-                    .emit_expr(cond, &Type::Bool)?
+                    .emit_expr(cond)?
                     .ok_or_else(|| CodegenError::Internal("if cond".into()))?
                     .into_int_value();
                 let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -188,22 +194,22 @@ impl<'ctx> Codegen<'ctx> {
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
                 self.builder.position_at_end(then_bb);
-                let tv = self.emit_expr(then_branch, expected)?;
+                let tv = self.emit_expr(then_branch)?;
                 let then_end = self.builder.get_insert_block().unwrap();
                 self.builder.build_unconditional_branch(merge_bb).map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
                 self.builder.position_at_end(else_bb);
-                let ev = self.emit_expr(else_branch, expected)?;
+                let ev = self.emit_expr(else_branch)?;
                 let else_end = self.builder.get_insert_block().unwrap();
                 self.builder.build_unconditional_branch(merge_bb).map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
                 self.builder.position_at_end(merge_bb);
 
-                if expected == &Type::Unit {
+                if ty == Type::Unit {
                     return Ok(None);
                 }
 
-                let bt = basic_type(self.context, expected);
+                let bt = basic_type(self.context, &ty);
                 let phi = self.builder.build_phi(bt, "iftmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 let tv = tv.ok_or_else(|| CodegenError::Internal("if then no value".into()))?;
                 let ev = ev.ok_or_else(|| CodegenError::Internal("if else no value".into()))?;
@@ -216,13 +222,13 @@ impl<'ctx> Codegen<'ctx> {
                 let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 for b in bindings {
                     let v = self
-                        .emit_expr(&b.value, &b.ty)?
+                        .emit_expr(&b.value)?
                         .ok_or_else(|| CodegenError::Internal("let value".into()))?;
                     let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
                     self.builder.build_store(alloca, v).map_err(|e| CodegenError::Llvm(e.to_string()))?;
                     prev.push((b.name.clone(), self.locals.insert(b.name.clone(), (alloca, b.ty.clone()))));
                 }
-                let result = self.emit_expr(body, expected)?;
+                let result = self.emit_expr(body)?;
                 // restore
                 for (name, p) in prev.into_iter().rev() {
                     match p {
@@ -234,14 +240,12 @@ impl<'ctx> Codegen<'ctx> {
             }
             ExprKind::Do(exprs) => {
                 let mut last: Option<BasicValueEnum<'ctx>> = None;
-                let len = exprs.len();
-                for (i, ex) in exprs.iter().enumerate() {
-                    let exp = if i + 1 == len { expected.clone() } else { Type::Unit };
-                    last = self.emit_expr(ex, &exp)?;
+                for ex in exprs {
+                    last = self.emit_expr(ex)?;
                 }
                 Ok(last)
             }
-            ExprKind::Call { callee, args } => self.emit_call(callee, args, expected),
+            ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
     }
 
@@ -249,43 +253,40 @@ impl<'ctx> Codegen<'ctx> {
         &mut self,
         callee: &str,
         args: &[Expr],
-        expected: &Type,
+        ret_ty: &Type,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        // numeric / comparison / logical builtins
         match callee {
             "+" | "-" | "*" | "/" | "mod" => {
-                let a = self.emit_expr(&args[0], expected)?.unwrap();
-                let b = self.emit_expr(&args[1], expected)?.unwrap();
-                let v = self.emit_arith(callee, a, b, expected)?;
+                let a = self.emit_expr(&args[0])?.unwrap();
+                let b = self.emit_expr(&args[1])?.unwrap();
+                let v = self.emit_arith(callee, a, b, ret_ty)?;
                 Ok(Some(v))
             }
             "<" | "<=" | ">" | ">=" | "=" | "!=" => {
-                // operands share a type; we don't statically know it here, so infer from arg
-                // using a best-effort: emit arg with no expected (reuse type from first lit)
-                let a = self.emit_expr(&args[0], &Type::I32)?.unwrap();
-                let b = self.emit_expr(&args[1], &Type::I32)?.unwrap();
+                let a = self.emit_expr(&args[0])?.unwrap();
+                let b = self.emit_expr(&args[1])?.unwrap();
                 let v = self.emit_cmp(callee, a, b)?;
                 Ok(Some(v.into()))
             }
             "and" => {
-                let a = self.emit_expr(&args[0], &Type::Bool)?.unwrap().into_int_value();
-                let b = self.emit_expr(&args[1], &Type::Bool)?.unwrap().into_int_value();
+                let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
+                let b = self.emit_expr(&args[1])?.unwrap().into_int_value();
                 let v = self.builder.build_and(a, b, "andtmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 Ok(Some(v.into()))
             }
             "or" => {
-                let a = self.emit_expr(&args[0], &Type::Bool)?.unwrap().into_int_value();
-                let b = self.emit_expr(&args[1], &Type::Bool)?.unwrap().into_int_value();
+                let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
+                let b = self.emit_expr(&args[1])?.unwrap().into_int_value();
                 let v = self.builder.build_or(a, b, "ortmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 Ok(Some(v.into()))
             }
             "not" => {
-                let a = self.emit_expr(&args[0], &Type::Bool)?.unwrap().into_int_value();
+                let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
                 let v = self.builder.build_not(a, "nottmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 Ok(Some(v.into()))
             }
             "println" => {
-                let s = self.emit_expr(&args[0], &Type::Str)?.unwrap();
+                let s = self.emit_expr(&args[0])?.unwrap();
                 let puts = self.fns["__puts"];
                 let argv: [BasicMetadataValueEnum; 1] = [s.into()];
                 self.builder
@@ -294,8 +295,7 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(None)
             }
             "print" => {
-                let s = self.emit_expr(&args[0], &Type::Str)?.unwrap();
-                // printf("%s", s)
+                let s = self.emit_expr(&args[0])?.unwrap();
                 let fmt = self.intern_str("%s");
                 let printf = self.fns["__printf"];
                 let argv: [BasicMetadataValueEnum; 2] = [fmt.into(), s.into()];
@@ -309,21 +309,21 @@ impl<'ctx> Codegen<'ctx> {
                     .fns
                     .get(callee)
                     .ok_or_else(|| CodegenError::Internal(format!("undef fn {callee}")))?;
-                let (param_tys, ret_ty) = self
+                let (_, fn_ret_ty) = self
                     .fn_types
                     .get(callee)
                     .cloned()
                     .ok_or_else(|| CodegenError::Internal(format!("no sig {callee}")))?;
                 let mut argv: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
-                for (a, pt) in args.iter().zip(param_tys.iter()) {
-                    let v = self.emit_expr(a, pt)?.unwrap();
+                for a in args.iter() {
+                    let v = self.emit_expr(a)?.unwrap();
                     argv.push(v.into());
                 }
                 let call = self
                     .builder
                     .build_call(fv, &argv, "calltmp")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                if ret_ty == Type::Unit {
+                if fn_ret_ty == Type::Unit {
                     Ok(None)
                 } else {
                     Ok(call.try_as_basic_value().basic())
@@ -337,9 +337,9 @@ impl<'ctx> Codegen<'ctx> {
         op: &str,
         a: BasicValueEnum<'ctx>,
         b: BasicValueEnum<'ctx>,
-        expected: &Type,
+        result_ty: &Type,
     ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        match expected {
+        match result_ty {
             Type::I32 | Type::I64 => {
                 let a = a.into_int_value();
                 let b = b.into_int_value();
@@ -407,14 +407,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn emit_lit(&mut self, l: &Lit, expected: &Type) -> BasicValueEnum<'ctx> {
+    fn emit_lit(&mut self, l: &Lit, ty: &Type) -> BasicValueEnum<'ctx> {
         match l {
-            Lit::Int(v, _) => match expected {
+            Lit::Int(v, _) => match ty {
                 Type::I32 => self.context.i32_type().const_int(*v as u64, true).into(),
                 Type::I64 => self.context.i64_type().const_int(*v as u64, true).into(),
                 _ => self.context.i32_type().const_int(*v as u64, true).into(),
             },
-            Lit::Float(v, _) => match expected {
+            Lit::Float(v, _) => match ty {
                 Type::F32 => self.context.f32_type().const_float(*v).into(),
                 Type::F64 => self.context.f64_type().const_float(*v).into(),
                 _ => self.context.f64_type().const_float(*v).into(),
@@ -441,16 +441,11 @@ impl<'ctx> Codegen<'ctx> {
     fn const_eval(&mut self, e: &Expr, expected: &Type) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         // For MVP: only literals as const initializers.
         match &e.kind {
-            ExprKind::Lit(l) => Ok(self.emit_lit_const(l, expected)),
+            ExprKind::Lit(l) => Ok(self.emit_lit(l, expected)),
             _ => Err(CodegenError::Internal(
                 "only literal constants supported in `def` for MVP".into(),
             )),
         }
-    }
-
-    fn emit_lit_const(&mut self, l: &Lit, expected: &Type) -> BasicValueEnum<'ctx> {
-        // Same as emit_lit but doesn't need a builder position.
-        self.emit_lit(l, expected)
     }
 }
 

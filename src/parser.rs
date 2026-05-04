@@ -192,7 +192,7 @@ impl<'a> Parser<'a> {
                 });
                 let span = Span::new(start, t.span.end);
                 self.bump();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Int(v, kind)), span })
+                Ok(Expr::new(ExprKind::Lit(Lit::Int(v, kind)), span))
             }
             Token::Float(v, suf) => {
                 let v = *v;
@@ -202,25 +202,25 @@ impl<'a> Parser<'a> {
                 });
                 let span = Span::new(start, t.span.end);
                 self.bump();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Float(v, kind)), span })
+                Ok(Expr::new(ExprKind::Lit(Lit::Float(v, kind)), span))
             }
             Token::Bool(b) => {
                 let b = *b;
                 let span = Span::new(start, t.span.end);
                 self.bump();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Bool(b)), span })
+                Ok(Expr::new(ExprKind::Lit(Lit::Bool(b)), span))
             }
             Token::Str(s) => {
                 let s = s.clone();
                 let span = Span::new(start, t.span.end);
                 self.bump();
-                Ok(Expr { kind: ExprKind::Lit(Lit::Str(s)), span })
+                Ok(Expr::new(ExprKind::Lit(Lit::Str(s)), span))
             }
             Token::Ident(name) => {
                 let name = name.clone();
                 let span = Span::new(start, t.span.end);
                 self.bump();
-                Ok(Expr { kind: ExprKind::Var(name), span })
+                Ok(Expr::new(ExprKind::Var(name), span))
             }
             Token::LParen => self.parse_compound(),
             other => Err(ParseError::Unexpected(format!("{:?}", other), start)),
@@ -242,14 +242,14 @@ impl<'a> Parser<'a> {
                 let then_branch = self.parse_expr()?;
                 let else_branch = self.parse_expr()?;
                 let rp = self.eat(&Token::RParen)?;
-                Ok(Expr {
-                    kind: ExprKind::If {
+                Ok(Expr::new(
+                    ExprKind::If {
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
                         else_branch: Box::new(else_branch),
                     },
-                    span: Span::new(start, rp.span.end),
-                })
+                    Span::new(start, rp.span.end),
+                ))
             }
             Some("let") => {
                 self.bump();
@@ -268,10 +268,10 @@ impl<'a> Parser<'a> {
                 self.eat(&Token::RBracket)?;
                 let body = self.parse_expr()?;
                 let rp = self.eat(&Token::RParen)?;
-                Ok(Expr {
-                    kind: ExprKind::Let { bindings, body: Box::new(body) },
-                    span: Span::new(start, rp.span.end),
-                })
+                Ok(Expr::new(
+                    ExprKind::Let { bindings, body: Box::new(body) },
+                    Span::new(start, rp.span.end),
+                ))
             }
             Some("do") => {
                 self.bump();
@@ -280,10 +280,10 @@ impl<'a> Parser<'a> {
                     exprs.push(self.parse_expr()?);
                 }
                 let rp = self.eat(&Token::RParen)?;
-                Ok(Expr {
-                    kind: ExprKind::Do(exprs),
-                    span: Span::new(start, rp.span.end),
-                })
+                Ok(Expr::new(
+                    ExprKind::Do(exprs),
+                    Span::new(start, rp.span.end),
+                ))
             }
             Some(_) | None => {
                 // generic call: callee must be ident
@@ -297,10 +297,10 @@ impl<'a> Parser<'a> {
                     args.push(self.parse_expr()?);
                 }
                 let rp = self.eat(&Token::RParen)?;
-                Ok(Expr {
-                    kind: ExprKind::Call { callee, args },
-                    span: Span::new(start, rp.span.end),
-                })
+                Ok(Expr::new(
+                    ExprKind::Call { callee, args },
+                    Span::new(start, rp.span.end),
+                ))
             }
         }
     }

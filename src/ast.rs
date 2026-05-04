@@ -1,4 +1,8 @@
 //! AST definitions for Risp (.rsp)
+//!
+//! Some fields (e.g. `span`) are not yet read by the codegen path but will be
+//! once richer error reporting lands. Suppress dead-code warnings until then.
+#![allow(dead_code)]
 
 use std::fmt;
 
@@ -82,6 +86,14 @@ pub enum FloatKind {
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+    /// Filled by the type checker. `None` until typeck has run.
+    pub ty: Option<Type>,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span, ty: None }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,10 @@
+; Comparison on i64 — verifies type propagation works for non-default int types.
+
+(defn max64 [a: i64, b: i64] -> i64
+  (if (> a b) a b))
+
+(defn main [] -> i32
+  (let [m: i64 (max64 100i64 42i64)]
+    (if (= m 100i64)
+      (do (println "ok: i64 cmp") 0)
+      (do (println "FAIL: i64 cmp") 1))))

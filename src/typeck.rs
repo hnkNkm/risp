@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)] // some variants are placeholders for future checks
 pub enum TypeError {
     #[error("undefined variable {0:?}")]
     UndefinedVar(String),
@@ -38,7 +39,7 @@ impl TypeCk {
         Self { fns: HashMap::new(), consts: HashMap::new() }
     }
 
-    pub fn check(&mut self, prog: &Program) -> Result<(), TypeError> {
+    pub fn check(&mut self, prog: &mut Program) -> Result<(), TypeError> {
         // collect signatures first (allow forward references)
         for it in &prog.items {
             match it {
@@ -65,19 +66,19 @@ impl TypeCk {
             None => return Err(TypeError::NoMain),
         }
 
-        for it in &prog.items {
+        for it in &mut prog.items {
             match it {
                 TopLevel::Function(f) => {
                     let mut env: HashMap<String, Type> = HashMap::new();
                     for p in &f.params {
                         env.insert(p.name.clone(), p.ty.clone());
                     }
-                    let body_ty = self.check_expr(&f.body, &mut env)?;
+                    let body_ty = self.check_expr(&mut f.body, &mut env)?;
                     expect(&f.ret, &body_ty)?;
                 }
                 TopLevel::Const(c) => {
                     let mut env = HashMap::new();
-                    let ty = self.check_expr(&c.value, &mut env)?;
+                    let ty = self.check_expr(&mut c.value, &mut env)?;
                     expect(&c.ty, &ty)?;
                 }
             }
@@ -85,16 +86,16 @@ impl TypeCk {
         Ok(())
     }
 
-    fn check_expr(&self, e: &Expr, env: &mut HashMap<String, Type>) -> Result<Type, TypeError> {
-        match &e.kind {
-            ExprKind::Lit(l) => Ok(lit_type(l)),
+    fn check_expr(&self, e: &mut Expr, env: &mut HashMap<String, Type>) -> Result<Type, TypeError> {
+        let ty = match &mut e.kind {
+            ExprKind::Lit(l) => lit_type(l),
             ExprKind::Var(name) => {
                 if let Some(t) = env.get(name) {
-                    Ok(t.clone())
+                    t.clone()
                 } else if let Some(t) = self.consts.get(name) {
-                    Ok(t.clone())
+                    t.clone()
                 } else {
-                    Err(TypeError::UndefinedVar(name.clone()))
+                    return Err(TypeError::UndefinedVar(name.clone()));
                 }
             }
             ExprKind::If { cond, then_branch, else_branch } => {
@@ -105,45 +106,49 @@ impl TypeCk {
                 if tt != et {
                     return Err(TypeError::Mismatch { expected: tt, found: et });
                 }
-                Ok(tt)
+                tt
             }
             ExprKind::Let { bindings, body } => {
                 let snapshot: Vec<(String, Option<Type>)> = bindings
                     .iter()
                     .map(|b| (b.name.clone(), env.get(&b.name).cloned()))
                     .collect();
-                for b in bindings {
-                    let vt = self.check_expr(&b.value, env)?;
+                for b in bindings.iter_mut() {
+                    let vt = self.check_expr(&mut b.value, env)?;
                     expect(&b.ty, &vt)?;
                     env.insert(b.name.clone(), b.ty.clone());
                 }
                 let bt = self.check_expr(body, env)?;
-                // restore
+                // restore shadowed bindings
                 for (name, prev) in snapshot {
                     match prev {
                         Some(t) => { env.insert(name, t); }
                         None => { env.remove(&name); }
                     }
                 }
-                Ok(bt)
+                bt
             }
             ExprKind::Do(exprs) => {
                 let mut last = Type::Unit;
-                for ex in exprs {
+                for ex in exprs.iter_mut() {
                     last = self.check_expr(ex, env)?;
                 }
-                Ok(last)
+                last
             }
-            ExprKind::Call { callee, args } => self.check_call(callee, args, env, &e.span),
-        }
+            ExprKind::Call { callee, args } => {
+                let callee = callee.clone();
+                self.check_call(&callee, args, env)?
+            }
+        };
+        e.ty = Some(ty.clone());
+        Ok(ty)
     }
 
     fn check_call(
         &self,
         callee: &str,
-        args: &[Expr],
+        args: &mut [Expr],
         env: &mut HashMap<String, Type>,
-        _span: &Span,
     ) -> Result<Type, TypeError> {
         // builtins first
         match callee {
@@ -151,8 +156,8 @@ impl TypeCk {
                 if args.len() != 2 {
                     return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
                 }
-                let a = self.check_expr(&args[0], env)?;
-                let b = self.check_expr(&args[1], env)?;
+                let a = self.check_expr(&mut args[0], env)?;
+                let b = self.check_expr(&mut args[1], env)?;
                 if a != b {
                     return Err(TypeError::Mismatch { expected: a, found: b });
                 }
@@ -165,8 +170,8 @@ impl TypeCk {
                 if args.len() != 2 {
                     return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
                 }
-                let a = self.check_expr(&args[0], env)?;
-                let b = self.check_expr(&args[1], env)?;
+                let a = self.check_expr(&mut args[0], env)?;
+                let b = self.check_expr(&mut args[1], env)?;
                 if a != b {
                     return Err(TypeError::Mismatch { expected: a, found: b });
                 }
@@ -179,7 +184,7 @@ impl TypeCk {
                 if args.len() != 2 {
                     return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len() });
                 }
-                for a in args {
+                for a in args.iter_mut() {
                     let t = self.check_expr(a, env)?;
                     expect(&Type::Bool, &t)?;
                 }
@@ -189,7 +194,7 @@ impl TypeCk {
                 if args.len() != 1 {
                     return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len() });
                 }
-                let t = self.check_expr(&args[0], env)?;
+                let t = self.check_expr(&mut args[0], env)?;
                 expect(&Type::Bool, &t)?;
                 Ok(Type::Bool)
             }
@@ -197,7 +202,7 @@ impl TypeCk {
                 if args.len() != 1 {
                     return Err(TypeError::Arity { name: callee.into(), expected: 1, got: args.len() });
                 }
-                let t = self.check_expr(&args[0], env)?;
+                let t = self.check_expr(&mut args[0], env)?;
                 expect(&Type::Str, &t)?;
                 Ok(Type::Unit)
             }
@@ -215,7 +220,7 @@ impl TypeCk {
                         got: args.len(),
                     });
                 }
-                for (param_ty, arg) in sig.params.iter().zip(args) {
+                for (param_ty, arg) in sig.params.iter().zip(args.iter_mut()) {
                     let at = self.check_expr(arg, env)?;
                     expect(param_ty, &at)?;
                 }

@@ -1,0 +1,15 @@
+# Cargo aliases for the Risp project.
+#
+#   cargo risp <subcommand> <args...>
+#
+# expands to
+#
+#   cargo run --quiet -- <subcommand> <args...>
+#
+# Example:
+#   cargo risp run examples/hello.rsp
+#   cargo risp emit-llvm examples/hello.rsp
+#   cargo risp build examples/hello.rsp -o hello
+
+[alias]
+risp = "run --quiet --"
