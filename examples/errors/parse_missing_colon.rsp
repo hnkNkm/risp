@@ -1,0 +1,7 @@
+; Should error: binding `x 1` is missing the `: type` annotation.
+;;! error_at: 7:6
+;;! error_contains: expected ':'
+
+(defn main [] -> i32
+  (let [x: i32 1
+    x))

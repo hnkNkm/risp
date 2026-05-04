@@ -169,6 +169,13 @@ e2e テストは各 `examples/*.rsp` 先頭の `;;!` ヘッダで期待値を宣
 ;;! exit: 0
 ```
 
+エラー診断は `examples/errors/*.rsp` で確認できる（コンパイルが失敗し、指定の行・列に診断が出ることを検証）:
+
+```lisp
+;;! error_at: 7:14
+;;! error_contains: undefined variable
+```
+
 ## 実装方針
 
 - パーサ: 手書き（S式は単純なので外部クレート不要）
