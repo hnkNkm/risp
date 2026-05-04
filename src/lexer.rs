@@ -41,14 +41,25 @@ pub struct Spanned {
 
 #[derive(Debug, Error)]
 pub enum LexError {
-    #[error("unexpected character {0:?} at byte {1}")]
+    #[error("unexpected character {0:?}")]
     UnexpectedChar(char, usize),
-    #[error("unterminated string starting at byte {0}")]
+    #[error("unterminated string")]
     UnterminatedString(usize),
-    #[error("invalid escape sequence \\{0} at byte {1}")]
+    #[error("invalid escape sequence \\{0}")]
     InvalidEscape(char, usize),
-    #[error("invalid number literal {0:?} at byte {1}")]
+    #[error("invalid number literal {0:?}")]
     InvalidNumber(String, usize),
+}
+
+impl LexError {
+    pub fn byte(&self) -> usize {
+        match self {
+            LexError::UnexpectedChar(_, b)
+            | LexError::UnterminatedString(b)
+            | LexError::InvalidEscape(_, b)
+            | LexError::InvalidNumber(_, b) => *b,
+        }
+    }
 }
 
 pub fn lex(src: &str) -> Result<Vec<Spanned>, LexError> {

@@ -1,16 +1,19 @@
 mod ast;
 mod codegen;
+mod diagnostic;
 mod lexer;
 mod parser;
 mod typeck;
 
 use clap::{Parser as ClapParser, Subcommand};
 use codegen::Codegen;
+use diagnostic::{Loc, render};
+use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::OptimizationLevel;
+use parser::FrontendError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,28 +45,30 @@ enum Cmd {
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
-        eprintln!("error: {e}");
+        eprint!("{e}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the requested command. The returned error string is already formatted
+/// for terminal display (may be a multi-line diagnostic ending in `\n`).
+fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::EmitAst { input } => {
-            let src = fs::read_to_string(&input)?;
-            let prog = parser::parse(&src)?;
+            let (src, file) = load(&input)?;
+            let prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
             println!("{prog:#?}");
         }
         Cmd::EmitLlvm { input } => {
-            let src = fs::read_to_string(&input)?;
-            let mut prog = parser::parse(&src)?;
+            let (src, file) = load(&input)?;
+            let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
             let mut tyck = typeck::TypeCk::new();
-            tyck.check(&mut prog)?;
+            tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;
             let context = Context::create();
             let mod_name = input.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
             let mut cg = Codegen::new(&context, mod_name);
-            cg.compile_program(&prog, &tyck)?;
-            cg.module.verify().map_err(|e| e.to_string())?;
+            cg.compile_program(&prog, &tyck).map_err(plain)?;
+            cg.module.verify().map_err(|e| plain(e.to_string()))?;
             print!("{}", cg.module.print_to_string().to_string());
         }
         Cmd::Build { input, output } => {
@@ -75,32 +80,60 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let exec = if out.is_absolute() {
                 out
             } else {
-                let mut p = std::env::current_dir()?;
+                let mut p = std::env::current_dir().map_err(plain)?;
                 p.push(out);
                 p
             };
-            let status = Command::new(&exec).status()?;
+            let status = Command::new(&exec).status().map_err(plain)?;
             std::process::exit(status.code().unwrap_or(1));
         }
     }
     Ok(())
 }
 
-fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let src = fs::read_to_string(input)?;
-    let mut prog = parser::parse(&src)?;
+fn load(input: &Path) -> Result<(String, String), String> {
+    let src = fs::read_to_string(input)
+        .map_err(|e| plain(format!("could not read {}: {e}", input.display())))?;
+    let file = input.display().to_string();
+    Ok((src, file))
+}
+
+fn plain<E: std::fmt::Display>(e: E) -> String {
+    format!("error: {e}\n")
+}
+
+fn render_frontend(file: &str, src: &str, e: &FrontendError) -> String {
+    match e {
+        FrontendError::Lex(le) => render(file, src, Loc::point(le.byte()), &le.to_string()),
+        FrontendError::Parse(pe) => match pe.byte() {
+            Some(b) => render(file, src, Loc::point(b), &pe.to_string()),
+            None => format!("error: {pe}\n  --> {file}\n"),
+        },
+    }
+}
+
+fn render_typeck(file: &str, src: &str, e: &typeck::TypeError) -> String {
+    match e.span() {
+        Some(s) => render(file, src, Loc::from_span(s), &e.to_string()),
+        None => format!("error: {e}\n  --> {file}\n"),
+    }
+}
+
+fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, String> {
+    let (src, file) = load(input)?;
+    let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
     let mut tyck = typeck::TypeCk::new();
-    tyck.check(&mut prog)?;
+    tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;
 
     let context = Context::create();
     let mod_name = input.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
     let mut cg = Codegen::new(&context, mod_name);
-    cg.compile_program(&prog, &tyck)?;
-    cg.module.verify().map_err(|e| e.to_string())?;
+    cg.compile_program(&prog, &tyck).map_err(plain)?;
+    cg.module.verify().map_err(|e| plain(e.to_string()))?;
 
-    Target::initialize_native(&InitializationConfig::default())?;
+    Target::initialize_native(&InitializationConfig::default()).map_err(plain)?;
     let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
+    let target = Target::from_triple(&triple).map_err(|e| plain(e.to_string()))?;
     let cpu = TargetMachine::get_host_cpu_name().to_string();
     let features = TargetMachine::get_host_cpu_features().to_string();
     let tm = target
@@ -112,7 +145,7 @@ fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
             RelocMode::PIC,
             CodeModel::Default,
         )
-        .ok_or("failed to create target machine")?;
+        .ok_or_else(|| plain("failed to create target machine"))?;
     cg.module.set_triple(&triple);
     cg.module.set_data_layout(&tm.get_target_data().get_data_layout());
 
@@ -122,16 +155,17 @@ fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
     };
     let obj_path = out_path.with_extension("o");
     tm.write_to_file(&cg.module, FileType::Object, &obj_path)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| plain(e.to_string()))?;
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = Command::new(&cc)
         .arg(&obj_path)
         .arg("-o")
         .arg(&out_path)
-        .status()?;
+        .status()
+        .map_err(plain)?;
     if !status.success() {
-        return Err(format!("linker {cc} failed").into());
+        return Err(plain(format!("linker {cc} failed")));
     }
     let _ = fs::remove_file(&obj_path);
     Ok(out_path)

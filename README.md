@@ -143,6 +143,18 @@ cargo risp run examples/hello.rsp
 cargo risp emit-llvm examples/hello.rsp
 ```
 
+## エラー表示
+
+字句・構文・型エラーは、ソースの行・列とキャレットで表示される:
+
+```
+error: undefined variable "missing"
+ --> examples/foo.rsp:3:14
+  |
+3 |     (println missing)
+  |              ^^^^^^^
+```
+
 ## テスト
 
 ```sh
@@ -190,7 +202,7 @@ cargo run -- run examples/hello.rsp
 ### Phase 2 — 短期改善
 - [x] 比較演算子の型伝播バグ修正（i64/floatでも動くように）
 - [x] ASTに型情報を埋め込む構造へリファクタ（`Expr.ty`）
-- [ ] エラー報告（行・列・ソース表示）
+- [x] エラー報告（行・列・ソース表示・キャレット）
 - [x] e2e テスト（`examples/` を実行して期待出力と比較）
 
 ### Phase 3 — 言語機能

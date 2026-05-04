@@ -8,16 +8,29 @@ use thiserror::Error;
 pub enum ParseError {
     #[error("unexpected end of input")]
     UnexpectedEof,
-    #[error("unexpected token {0:?} at byte {1}")]
+    #[error("unexpected token {0}")]
     Unexpected(String, usize),
-    #[error("unknown type {0:?} at byte {1}")]
+    #[error("unknown type {0:?}")]
     UnknownType(String, usize),
-    #[error("expected {expected}, found {found:?} at byte {at}")]
+    #[error("expected {expected}, found {found}")]
     Expected {
         expected: &'static str,
         found: String,
         at: usize,
     },
+}
+
+impl ParseError {
+    /// Best-effort byte offset for diagnostics. `None` for EOF errors,
+    /// where the caller should fall back to "end of file".
+    pub fn byte(&self) -> Option<usize> {
+        match self {
+            ParseError::UnexpectedEof => None,
+            ParseError::Unexpected(_, b)
+            | ParseError::UnknownType(_, b)
+            | ParseError::Expected { at: b, .. } => Some(*b),
+        }
+    }
 }
 
 pub struct Parser<'a> {
@@ -337,7 +350,16 @@ fn token_name(t: &Token) -> &'static str {
     }
 }
 
-pub fn parse(src: &str) -> Result<Program, Box<dyn std::error::Error>> {
+/// Combined lex/parse error so callers can match on either stage.
+#[derive(Debug, Error)]
+pub enum FrontendError {
+    #[error(transparent)]
+    Lex(#[from] crate::lexer::LexError),
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+}
+
+pub fn parse(src: &str) -> Result<Program, FrontendError> {
     let toks = crate::lexer::lex(src)?;
     let mut p = Parser::new(&toks);
     Ok(p.parse_program()?)
