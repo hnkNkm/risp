@@ -96,10 +96,142 @@ impl<'a> Parser<'a> {
                 let c = self.parse_def_body(start)?;
                 Ok(TopLevel::Const(c))
             }
+            "struct" => {
+                let s = self.parse_struct_body(start)?;
+                Ok(TopLevel::Struct(s))
+            }
+            "enum" => {
+                let e = self.parse_enum_body(start)?;
+                Ok(TopLevel::Enum(e))
+            }
             other => Err(ParseError::Unexpected(
                 format!("top-level form {:?}", other),
                 head.span.start,
             )),
+        }
+    }
+
+    /// `struct Name [f: T, ...] )` — LParen + "struct" already consumed
+    fn parse_struct_body(&mut self, start: usize) -> Result<StructDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        self.eat(&Token::LBracket)?;
+        let mut fields = Vec::new();
+        loop {
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::RBracket)) {
+                break;
+            }
+            fields.push(self.parse_field_def()?);
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
+                self.bump();
+            }
+        }
+        self.eat(&Token::RBracket)?;
+        let rp = self.eat(&Token::RParen)?;
+        Ok(StructDef {
+            name,
+            fields,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    fn parse_field_def(&mut self) -> Result<FieldDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let start = name_tok.span.start;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => return Err(ParseError::Unexpected(format!("{:?}", other), start)),
+        };
+        self.eat(&Token::Colon)?;
+        let ty = self.parse_type()?;
+        let end = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(FieldDef {
+            name,
+            ty,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// `enum Name Variant* )` — LParen + "enum" already consumed
+    fn parse_enum_body(&mut self, start: usize) -> Result<EnumDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        let mut variants = Vec::new();
+        while !matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+            variants.push(self.parse_variant_def()?);
+        }
+        let rp = self.eat(&Token::RParen)?;
+        Ok(EnumDef {
+            name,
+            variants,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    fn parse_variant_def(&mut self) -> Result<VariantDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let start = name_tok.span.start;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => return Err(ParseError::Unexpected(format!("{:?}", other), start)),
+        };
+        // Optional payload type: another type token that is not `)` and not a bare
+        // variant name start of next... Payload is a type (ident or (Array ...)).
+        let payload = match self.peek().map(|s| &s.tok) {
+            Some(Token::Ident(_)) | Some(Token::LParen) => {
+                // Ambiguous: next Ident could be next unit variant. Only treat as
+                // payload if it looks like a type keyword / Array / or we require
+                // payload types to be primitives / Array only — still ambiguous with
+                // variant names like `i32` (unlikely). Heuristic: if next token is a
+                // known primitive type name or `(`, parse as type; else next variant.
+                if self.peek_is_type_start() {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let end = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(VariantDef {
+            name,
+            payload,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn peek_is_type_start(&self) -> bool {
+        match self.peek().map(|s| &s.tok) {
+            Some(Token::LParen) => true,
+            Some(Token::Ident(s)) => matches!(
+                s.as_str(),
+                "i32" | "i64" | "f32" | "f64" | "bool" | "str" | "unit"
+            ),
+            _ => false,
         }
     }
 
@@ -190,7 +322,7 @@ impl<'a> Parser<'a> {
                         "bool" => Ok(Type::Bool),
                         "str" => Ok(Type::Str),
                         "unit" => Ok(Type::Unit),
-                        other => Err(ParseError::UnknownType(other.to_string(), t.span.start)),
+                        other => Ok(Type::Named(other.to_string())),
                     },
                     _ => unreachable!(),
                 }
@@ -404,6 +536,44 @@ impl<'a> Parser<'a> {
                     Span::new(start, rp.span.end),
                 ))
             }
+            Some("field") => {
+                self.bump();
+                let base = self.parse_expr()?;
+                let field_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let field = match &field_tok.tok {
+                    Token::Ident(s) => s.clone(),
+                    other => {
+                        return Err(ParseError::Unexpected(
+                            format!("{:?}", other),
+                            field_tok.span.start,
+                        ));
+                    }
+                };
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Field {
+                        base: Box::new(base),
+                        field,
+                    },
+                    Span::new(start, rp.span.end),
+                ))
+            }
+            Some("match") => {
+                self.bump();
+                let scrutinee = self.parse_expr()?;
+                let mut arms = Vec::new();
+                while !matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+                    arms.push(self.parse_match_arm()?);
+                }
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Match {
+                        scrutinee: Box::new(scrutinee),
+                        arms,
+                    },
+                    Span::new(start, rp.span.end),
+                ))
+            }
             Some(_) | None => {
                 // generic call: callee must be ident
                 let callee_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
@@ -436,6 +606,59 @@ impl<'a> Parser<'a> {
         let value = self.parse_expr()?;
         let end = value.span.end;
         Ok(Binding { name, ty, value, span: Span::new(start, end) })
+    }
+
+    /// `(Variant body)` or `(Variant binding body)`
+    fn parse_match_arm(&mut self) -> Result<MatchArm, ParseError> {
+        let lp = self.eat(&Token::LParen)?;
+        let start = lp.span.start;
+        let var_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let variant = match &var_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    var_tok.span.start,
+                ));
+            }
+        };
+
+        let (binding, body) = match self.peek().map(|s| &s.tok) {
+            Some(Token::RParen) => {
+                return Err(ParseError::Expected {
+                    expected: "match arm body",
+                    found: "')'".into(),
+                    at: self.peek().map(|s| s.span.start).unwrap_or(start),
+                });
+            }
+            Some(Token::Ident(_)) => {
+                let id_tok = self.bump().unwrap();
+                let id_start = id_tok.span.start;
+                let id_end = id_tok.span.end;
+                let id = match &id_tok.tok {
+                    Token::Ident(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                if matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+                    (
+                        None,
+                        Expr::new(ExprKind::Var(id), Span::new(id_start, id_end)),
+                    )
+                } else {
+                    let body = self.parse_expr()?;
+                    (Some(id), body)
+                }
+            }
+            _ => (None, self.parse_expr()?),
+        };
+
+        let rp = self.eat(&Token::RParen)?;
+        Ok(MatchArm {
+            variant,
+            binding,
+            body,
+            span: Span::new(start, rp.span.end),
+        })
     }
 }
 

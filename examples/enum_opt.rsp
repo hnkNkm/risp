@@ -1,0 +1,19 @@
+; enum construct + exhaustive match (unit / payload variants).
+;;! stdout: ok: enum
+;;! exit: 0
+
+(enum Opt
+  None
+  Some i32)
+
+(defn unwrap-or [o: Opt, d: i32] -> i32
+  (match o
+    (None d)
+    (Some n n)))
+
+(defn main [] -> i32
+  (let [a: i32 (unwrap-or (None) 10)
+        b: i32 (unwrap-or (Some 42) 0)]
+    (if (and (= a 10) (= b 42))
+      (do (println "ok: enum") 0)
+      (do (println "FAIL: enum") 1))))

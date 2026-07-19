@@ -1,7 +1,7 @@
 //! LLVM IR codegen using inkwell.
 
 use crate::ast::*;
-use crate::typeck::TypeCk;
+use crate::typeck::{TypeCk, VariantInfo};
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -9,8 +9,8 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType, StructType};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -40,6 +40,9 @@ pub struct Codegen<'ctx> {
     /// Loop header for self-tail-call optimization.
     loop_header: Option<BasicBlock<'ctx>>,
     str_count: usize,
+    structs: HashMap<String, StructDef>,
+    enums: HashMap<String, EnumDef>,
+    variants: HashMap<String, VariantInfo>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -59,6 +62,9 @@ impl<'ctx> Codegen<'ctx> {
             current_fn: None,
             loop_header: None,
             str_count: 0,
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            variants: HashMap::new(),
         }
     }
 
@@ -67,7 +73,11 @@ impl<'ctx> Codegen<'ctx> {
         self.module
     }
 
-    pub fn compile_program(&mut self, prog: &Program, _tyck: &TypeCk) -> Result<(), CodegenError> {
+    pub fn compile_program(&mut self, prog: &Program, tyck: &TypeCk) -> Result<(), CodegenError> {
+        self.structs = tyck.structs.clone();
+        self.enums = tyck.enums.clone();
+        self.variants = tyck.variants.clone();
+
         // declare external `puts(i8*) -> i32` for println
         let i32_ty = self.context.i32_type();
         let i8ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -146,15 +156,61 @@ impl<'ctx> Codegen<'ctx> {
 
     fn fn_type(&self, params: &[Type], ret: &Type) -> FunctionType<'ctx> {
         let param_tys: Vec<BasicMetadataTypeEnum> =
-            params.iter().map(|t| basic_metadata(self.context, t)).collect();
+            params.iter().map(|t| self.basic_metadata(t)).collect();
         match ret {
             Type::Unit => self.context.void_type().fn_type(&param_tys, false),
-            other => match basic_type(self.context, other) {
+            other => match self.llvm_basic(other) {
                 BasicTypeEnum::IntType(t) => t.fn_type(&param_tys, false),
                 BasicTypeEnum::FloatType(t) => t.fn_type(&param_tys, false),
                 BasicTypeEnum::PointerType(t) => t.fn_type(&param_tys, false),
+                BasicTypeEnum::StructType(t) => t.fn_type(&param_tys, false),
                 _ => unreachable!(),
             },
+        }
+    }
+
+    fn llvm_enum_ty(&self) -> StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.context.i32_type().into(),
+                self.context.i64_type().into(),
+            ],
+            false,
+        )
+    }
+
+    fn llvm_struct_ty(&self, name: &str) -> StructType<'ctx> {
+        let sdef = &self.structs[name];
+        let fields: Vec<BasicTypeEnum> = sdef
+            .fields
+            .iter()
+            .map(|f| self.llvm_basic(&f.ty))
+            .collect();
+        self.context.struct_type(&fields, false)
+    }
+
+    fn llvm_basic(&self, t: &Type) -> BasicTypeEnum<'ctx> {
+        match t {
+            Type::I32 => self.context.i32_type().into(),
+            Type::I64 => self.context.i64_type().into(),
+            Type::F32 => self.context.f32_type().into(),
+            Type::F64 => self.context.f64_type().into(),
+            Type::Bool => self.context.bool_type().into(),
+            Type::Str | Type::Array { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Named(n) if self.structs.contains_key(n) => self.llvm_struct_ty(n).into(),
+            Type::Named(n) if self.enums.contains_key(n) => self.llvm_enum_ty().into(),
+            Type::Named(n) => panic!("unknown named type {n}"),
+            Type::Unit => panic!("unit has no basic type"),
+        }
+    }
+
+    fn basic_metadata(&self, t: &Type) -> BasicMetadataTypeEnum<'ctx> {
+        match self.llvm_basic(t) {
+            BasicTypeEnum::IntType(t) => t.into(),
+            BasicTypeEnum::FloatType(t) => t.into(),
+            BasicTypeEnum::PointerType(t) => t.into(),
+            BasicTypeEnum::StructType(t) => t.into(),
+            _ => unreachable!(),
         }
     }
 
@@ -359,11 +415,12 @@ impl<'ctx> Codegen<'ctx> {
             let at = llvm_array_type(self.context, elem, *len);
             return tmp_builder.build_alloca(at, name).unwrap();
         }
-        let bt = basic_type(self.context, ty);
+        let bt = self.llvm_basic(ty);
         let alloca = match bt {
             BasicTypeEnum::IntType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             BasicTypeEnum::FloatType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             BasicTypeEnum::PointerType(t) => tmp_builder.build_alloca(t, name).unwrap(),
+            BasicTypeEnum::StructType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             _ => panic!("unsupported alloca type"),
         };
         // Rc strings start as null so release-before-store is safe.
@@ -476,7 +533,7 @@ impl<'ctx> Codegen<'ctx> {
                     } else if vty == Type::Str {
                         Ok(Some(self.load_str_owned(ptr)?.into()))
                     } else {
-                        let bt = basic_type(self.context, &vty);
+                        let bt = self.llvm_basic(&vty);
                         let v = self
                             .builder
                             .build_load(bt, ptr, name)
@@ -525,7 +582,7 @@ impl<'ctx> Codegen<'ctx> {
                     return Ok(None);
                 }
 
-                let bt = basic_type(self.context, &ty);
+                let bt = self.llvm_basic(&ty);
                 let phi = self.builder.build_phi(bt, "iftmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 let tv = tv.ok_or_else(|| CodegenError::Internal("if then no value".into()))?;
                 let ev = ev.ok_or_else(|| CodegenError::Internal("if else no value".into()))?;
@@ -610,8 +667,254 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::ArrayLit { elem_ty, elems } => {
                 Ok(Some(self.emit_array_lit(elem_ty, elems)?.into()))
             }
+            ExprKind::Field { base, field } => Ok(Some(self.emit_field(base, field)?)),
+            ExprKind::Match { scrutinee, arms } => self.emit_match(scrutinee, arms, &ty),
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
+    }
+
+    fn emit_field(&mut self, base: &Expr, field: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let base_ty = Self::expr_ty(base)?.clone();
+        let Type::Named(ref n) = base_ty else {
+            return Err(CodegenError::Internal("field on non-struct".into()));
+        };
+        let sdef = self
+            .structs
+            .get(n)
+            .ok_or_else(|| CodegenError::Internal(format!("no struct {n}")))?
+            .clone();
+        let idx = sdef
+            .fields
+            .iter()
+            .position(|f| f.name == field)
+            .ok_or_else(|| CodegenError::Internal(format!("no field {field}")))?;
+        let sv = self
+            .emit_expr(base)?
+            .ok_or_else(|| CodegenError::Internal("field base".into()))?
+            .into_struct_value();
+        self.builder
+            .build_extract_value(sv, idx as u32, field)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))
+    }
+
+    fn emit_struct_lit(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let sdef = self.structs[name].clone();
+        let st = self.llvm_struct_ty(name);
+        let mut agg = st.get_undef();
+        for (i, (field, arg)) in sdef.fields.iter().zip(args.iter()).enumerate() {
+            let v = self
+                .emit_expr(arg)?
+                .ok_or_else(|| CodegenError::Internal("struct field".into()))?;
+            agg = self
+                .builder
+                .build_insert_value(agg, v, i as u32, &field.name)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into_struct_value();
+        }
+        Ok(agg.into())
+    }
+
+    fn emit_variant_lit(
+        &mut self,
+        info: &VariantInfo,
+        args: &[Expr],
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let et = self.llvm_enum_ty();
+        let tag = self.context.i32_type().const_int(info.tag as u64, false);
+        let payload_bits = if let Some(pty) = &info.payload {
+            let v = self
+                .emit_expr(&args[0])?
+                .ok_or_else(|| CodegenError::Internal("variant payload".into()))?;
+            self.pack_payload(v, pty)?
+        } else {
+            self.context.i64_type().const_int(0, false)
+        };
+        let mut agg = et.get_undef();
+        agg = self
+            .builder
+            .build_insert_value(agg, tag, 0, "tag")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_struct_value();
+        agg = self
+            .builder
+            .build_insert_value(agg, payload_bits, 1, "payload")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_struct_value();
+        Ok(agg.into())
+    }
+
+    fn pack_payload(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        ty: &Type,
+    ) -> Result<IntValue<'ctx>, CodegenError> {
+        let i64_ty = self.context.i64_type();
+        match ty {
+            Type::I64 => Ok(v.into_int_value()),
+            Type::I32 | Type::Bool => Ok(self
+                .builder
+                .build_int_z_extend(v.into_int_value(), i64_ty, "zext")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?),
+            Type::F64 => Ok(self
+                .builder
+                .build_bit_cast(v.into_float_value(), i64_ty, "f64bits")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into_int_value()),
+            Type::F32 => {
+                let bits32 = self
+                    .builder
+                    .build_bit_cast(v.into_float_value(), self.context.i32_type(), "f32bits")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                    .into_int_value();
+                Ok(self
+                    .builder
+                    .build_int_z_extend(bits32, i64_ty, "f32zext")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?)
+            }
+            other => Err(CodegenError::Internal(format!(
+                "cannot pack payload type {other}"
+            ))),
+        }
+    }
+
+    fn unpack_payload(
+        &self,
+        bits: IntValue<'ctx>,
+        ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match ty {
+            Type::I64 => Ok(bits.into()),
+            Type::I32 => Ok(self
+                .builder
+                .build_int_truncate(bits, self.context.i32_type(), "trunc")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into()),
+            Type::Bool => Ok(self
+                .builder
+                .build_int_truncate(bits, self.context.bool_type(), "truncb")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into()),
+            Type::F64 => Ok(self
+                .builder
+                .build_bit_cast(bits, self.context.f64_type(), "f64")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?),
+            Type::F32 => {
+                let lo = self
+                    .builder
+                    .build_int_truncate(bits, self.context.i32_type(), "f32lo")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                Ok(self
+                    .builder
+                    .build_bit_cast(lo, self.context.f32_type(), "f32")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?)
+            }
+            other => Err(CodegenError::Internal(format!(
+                "cannot unpack payload type {other}"
+            ))),
+        }
+    }
+
+    fn emit_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        result_ty: &Type,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        let ev = self
+            .emit_expr(scrutinee)?
+            .ok_or_else(|| CodegenError::Internal("match scrutinee".into()))?
+            .into_struct_value();
+        let tag = self
+            .builder
+            .build_extract_value(ev, 0, "mtag")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+        let payload = self
+            .builder
+            .build_extract_value(ev, 1, "mpayload")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+
+        let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let merge_bb = self.context.append_basic_block(fv, "match.end");
+        let else_bb = self.context.append_basic_block(fv, "match.unreachable");
+
+        let mut cases = Vec::with_capacity(arms.len());
+        let mut arm_bbs = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let info = &self.variants[&arm.variant];
+            let bb = self
+                .context
+                .append_basic_block(fv, &format!("match.{}", arm.variant));
+            let tag_c = self.context.i32_type().const_int(info.tag as u64, false);
+            cases.push((tag_c, bb));
+            arm_bbs.push(bb);
+        }
+
+        self.builder
+            .build_switch(tag, else_bb, &cases)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+        for (arm, bb) in arms.iter().zip(arm_bbs.into_iter()) {
+            self.builder.position_at_end(bb);
+            let info = self.variants[&arm.variant].clone();
+            let prev = if let (Some(pty), Some(bname)) = (&info.payload, &arm.binding) {
+                let unpacked = self.unpack_payload(payload, pty)?;
+                let alloca = self.create_entry_alloca(fv, bname, pty);
+                self.builder
+                    .build_store(alloca, unpacked)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.locals.insert(bname.clone(), (alloca, pty.clone()))
+            } else {
+                None
+            };
+
+            let body_v = self.emit_expr(&arm.body)?;
+            let end_bb = self.builder.get_insert_block().unwrap();
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+            if let Some(bname) = &arm.binding {
+                match prev {
+                    Some(x) => {
+                        self.locals.insert(bname.clone(), x);
+                    }
+                    None => {
+                        self.locals.remove(bname);
+                    }
+                }
+            }
+
+            if *result_ty != Type::Unit {
+                let v = body_v.ok_or_else(|| CodegenError::Internal("match arm value".into()))?;
+                incoming.push((v, end_bb));
+            }
+        }
+
+        self.builder.position_at_end(else_bb);
+        self.builder
+            .build_unreachable()
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(merge_bb);
+        if *result_ty == Type::Unit {
+            return Ok(None);
+        }
+        let bt = self.llvm_basic(result_ty);
+        let phi = self
+            .builder
+            .build_phi(bt, "matchtmp")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        for (v, bb) in &incoming {
+            phi.add_incoming(&[(v, *bb)]);
+        }
+        Ok(Some(phi.as_basic_value()))
     }
 
     fn release_let_str_bindings(&self, bindings: &[Binding]) -> Result<(), CodegenError> {
@@ -725,7 +1028,7 @@ impl<'ctx> Codegen<'ctx> {
                 .build_in_bounds_gep(arr_ty, arr_ptr, &[zero, idx], "agetptr")
                 .map_err(|e| CodegenError::Llvm(e.to_string()))?
         };
-        let bt = basic_type(self.context, &elem);
+        let bt = self.llvm_basic(&elem);
         self.builder
             .build_load(bt, ep, "aget")
             .map_err(|e| CodegenError::Llvm(e.to_string()))
@@ -919,6 +1222,13 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(None)
             }
             "alen" => Ok(Some(self.emit_alen(args)?.into())),
+            _ if self.structs.contains_key(callee) => {
+                Ok(Some(self.emit_struct_lit(callee, args)?))
+            }
+            _ if self.variants.contains_key(callee) => {
+                let info = self.variants[callee].clone();
+                Ok(Some(self.emit_variant_lit(&info, args)?))
+            }
             _ => {
                 let fv = *self
                     .fns
@@ -1130,7 +1440,7 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = selected.into_pointer_value();
                 ("%s", ptr.into())
             }
-            Type::Str | Type::Unit | Type::Array { .. } => {
+            Type::Str | Type::Unit | Type::Array { .. } | Type::Named(_) => {
                 return Err(CodegenError::Internal("cannot print this type".into()));
             }
         };
@@ -1311,18 +1621,6 @@ impl<'ctx> Codegen<'ctx> {
     }
 }
 
-fn basic_type<'ctx>(ctx: &'ctx Context, t: &Type) -> BasicTypeEnum<'ctx> {
-    match t {
-        Type::I32 => ctx.i32_type().into(),
-        Type::I64 => ctx.i64_type().into(),
-        Type::F32 => ctx.f32_type().into(),
-        Type::F64 => ctx.f64_type().into(),
-        Type::Bool => ctx.bool_type().into(),
-        Type::Str | Type::Array { .. } => ctx.ptr_type(AddressSpace::default()).into(),
-        Type::Unit => panic!("unit has no basic type"),
-    }
-}
-
 fn llvm_array_type<'ctx>(
     ctx: &'ctx Context,
     elem: &Type,
@@ -1335,14 +1633,5 @@ fn llvm_array_type<'ctx>(
         Type::F64 => ctx.f64_type().array_type(len),
         Type::Bool => ctx.bool_type().array_type(len),
         other => panic!("unsupported array element type {other}"),
-    }
-}
-
-fn basic_metadata<'ctx>(ctx: &'ctx Context, t: &Type) -> BasicMetadataTypeEnum<'ctx> {
-    match basic_type(ctx, t) {
-        BasicTypeEnum::IntType(t) => t.into(),
-        BasicTypeEnum::FloatType(t) => t.into(),
-        BasicTypeEnum::PointerType(t) => t.into(),
-        _ => unreachable!(),
     }
 }

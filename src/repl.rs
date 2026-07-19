@@ -94,7 +94,7 @@ fn print_help() {
          ;   :quit / :q     exit\n\
          ;   :clear         drop accumulated definitions\n\
          ;   :defs          show accumulated definitions\n\
-         ; Definitions (`defn` / `def`) persist across inputs.\n\
+         ; Definitions (`defn` / `def` / `struct` / `enum`) persist across inputs.\n\
          ; Other expressions are JIT-evaluated and printed."
     );
 }
@@ -173,7 +173,12 @@ fn jit_call(prog: &crate::ast::Program, tyck: &TypeCk, fn_name: &str) -> Result<
 
 fn is_definition(src: &str) -> bool {
     let t = src.trim_start();
-    t.starts_with("(defn") || t.starts_with("(def ") || t.starts_with("(def\t") || t.starts_with("(def\n")
+    t.starts_with("(defn")
+        || t.starts_with("(def ")
+        || t.starts_with("(def\t")
+        || t.starts_with("(def\n")
+        || t.starts_with("(struct")
+        || t.starts_with("(enum")
 }
 
 /// Net open paren/bracket count. Ignores contents of string literals.
