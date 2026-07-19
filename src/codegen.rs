@@ -256,12 +256,7 @@ impl<'ctx> Codegen<'ctx> {
         ret_ty: &Type,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         match callee {
-            "+" | "-" | "*" | "/" | "mod" => {
-                let a = self.emit_expr(&args[0])?.unwrap();
-                let b = self.emit_expr(&args[1])?.unwrap();
-                let v = self.emit_arith(callee, a, b, ret_ty)?;
-                Ok(Some(v))
-            }
+            "+" | "-" | "*" | "/" | "mod" => Ok(Some(self.emit_arith_call(callee, args, ret_ty)?)),
             "<" | "<=" | ">" | ">=" | "=" | "!=" => {
                 let a = self.emit_expr(&args[0])?.unwrap();
                 let b = self.emit_expr(&args[1])?.unwrap();
@@ -398,6 +393,62 @@ impl<'ctx> Codegen<'ctx> {
         let true_v = bool_ty.const_int(1, false);
         phi.add_incoming(&[(&true_v, entry_bb), (&b, rhs_end)]);
         Ok(phi.as_basic_value().into_int_value())
+    }
+
+    fn emit_arith_call(
+        &mut self,
+        op: &str,
+        args: &[Expr],
+        result_ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        // Unary minus: `(- x)`
+        if op == "-" && args.len() == 1 {
+            let a = self
+                .emit_expr(&args[0])?
+                .ok_or_else(|| CodegenError::Internal("unary -".into()))?;
+            return self.emit_neg(a, result_ty);
+        }
+        // Identity for single-arg `+` / `*`
+        if matches!(op, "+" | "*") && args.len() == 1 {
+            return self
+                .emit_expr(&args[0])?
+                .ok_or_else(|| CodegenError::Internal("arith identity".into()));
+        }
+        // Binary / n-ary: left fold
+        let mut acc = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("arith lhs".into()))?;
+        for arg in args.iter().skip(1) {
+            let b = self
+                .emit_expr(arg)?
+                .ok_or_else(|| CodegenError::Internal("arith rhs".into()))?;
+            acc = self.emit_arith(op, acc, b, result_ty)?;
+        }
+        Ok(acc)
+    }
+
+    fn emit_neg(
+        &self,
+        a: BasicValueEnum<'ctx>,
+        result_ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match result_ty {
+            Type::I32 | Type::I64 => {
+                let v = self
+                    .builder
+                    .build_int_neg(a.into_int_value(), "neg")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                Ok(v.into())
+            }
+            Type::F32 | Type::F64 => {
+                let v = self
+                    .builder
+                    .build_float_neg(a.into_float_value(), "fneg")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                Ok(v.into())
+            }
+            other => Err(CodegenError::Internal(format!("neg on {other}"))),
+        }
     }
 
     fn emit_arith(
