@@ -117,6 +117,13 @@ ok: f64 cmp
   (if cond body (do)))
 (when true (println "ok"))
 
+;; モジュール（1ファイル = 1モジュール。任意の先頭 `(module name)`）
+;; math.rsp:
+;;   (module math)
+;;   (defn add [x: i32, y: i32] -> i32 (+ x y))
+(import math)
+(math/add 2 3)
+
 ;; 条件分岐
 (if (< x 0) (- x) x)
 
@@ -142,7 +149,7 @@ ok: f64 cmp
 - 数値リテラル: `42`, `42i64`, `3.14`, `3.14f32`
 - 文字列リテラル: `"hello"`（エスケープ: `\n` `\t` `\\` `\"`）
 - 真偽値: `true`, `false`
-- 識別子: `[a-zA-Z_][a-zA-Z0-9_-]*`（kebab-case可）
+- 識別子: 英字 / `_` / 演算子文字で開始。継続に `/` を含める（修飾名 `math/add` は1トークン）
 - 記号: `( ) [ ] : , ->`
 
 #### 引数リスト・束縛リストは `[]`
@@ -169,6 +176,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | trait | `(trait Name (method [self ...] -> T)*)` / `(impl Name for T ...)`（静的ディスパッチ。先頭引数は bare `self` 可） |
 | ジェネリクス | `(defn f [T] [x: T] -> T ...)` / `(defn f [T: Trait] [x: T] -> ...)`（呼び出し時に単相化。struct/enum は未対応） |
 | マクロ | `(defmacro name [params] template)`（型検査前に Call をテンプレートへ置換。非衛生的） |
+| モジュール | `(module name)` / `(import name)`（同ディレクトリの `name.rsp` を読込。定義は `name/` 接頭辞。REPL では import 不可） |
 | FFI | `(extern "C" name [params] -> ret)`（プリミティブ / `str`。`str` は C 文字列に変換） |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
@@ -186,6 +194,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
   → Lexer
   → Parser (S式)
   → AST
+  → Resolve (import / module 接頭辞マージ)
   → MacroExpand (defmacro)
   → TypeChecker
   → LLVM IR (inkwell)
@@ -307,11 +316,12 @@ cargo run -- run examples/hello.rsp
 - [x] ジェネリクス（`defn` の単相化 MVP。型パラメータ + trait bound）
 - [x] マクロ（`defmacro`、非衛生的な構文置換 MVP）
 - [x] REPL（inkwell::execution_engine でJIT）
+- [x] モジュール（`(import name)` / 修飾名 `mod/f` MVP）
 
 ### Phase 5 — Nice to have
 - [ ] 所有権・借用検査
 - [x] FFI（`(extern "C" …)`）
-- [ ] モジュールシステム
+- [ ] モジュール検索パスの拡張 / 再エクスポート
 
 ## ライセンス
 

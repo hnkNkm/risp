@@ -5,6 +5,7 @@ mod lexer;
 mod macroexpand;
 mod parser;
 mod repl;
+mod resolve;
 mod typeck;
 
 use clap::{Parser as ClapParser, Subcommand};
@@ -66,6 +67,8 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::EmitLlvm { input } => {
             let (src, file) = load(&input)?;
             let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
+            resolve::resolve(&mut prog, &input, &src)
+                .map_err(|e| render_resolve(&file, &src, &e))?;
             macroexpand::expand(&mut prog).map_err(|e| render_macro(&file, &src, &e))?;
             let mut tyck = typeck::TypeCk::new();
             tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;
@@ -134,9 +137,24 @@ fn render_macro(file: &str, src: &str, e: &macroexpand::MacroError) -> String {
     }
 }
 
+fn render_resolve(file: &str, src: &str, e: &resolve::ResolveError) -> String {
+    match e {
+        resolve::ResolveError::Frontend {
+            file: f,
+            src: s,
+            err,
+        } => render_frontend(f, s, err),
+        _ => match e.span() {
+            Some(span) => render(file, src, Loc::from_span(span), &e.to_string()),
+            None => format!("error: {e}\n  --> {file}\n"),
+        },
+    }
+}
+
 fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, String> {
     let (src, file) = load(input)?;
     let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
+    resolve::resolve(&mut prog, input, &src).map_err(|e| render_resolve(&file, &src, &e))?;
     macroexpand::expand(&mut prog).map_err(|e| render_macro(&file, &src, &e))?;
     let mut tyck = typeck::TypeCk::new();
     tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;

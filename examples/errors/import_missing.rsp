@@ -1,0 +1,7 @@
+; Missing import target.
+;;! error_at: 5:1
+;;! error_contains: not found
+
+(import missing)
+
+(defn main [] -> i32 0)
