@@ -1,0 +1,19 @@
+; print / println for non-str types.
+;;! stdout: 42
+;;! stdout: 100
+;;! stdout: 3.14
+;;! stdout: true
+;;! stdout: false
+;;! stdout: answer=42
+;;! exit: 0
+
+(defn main [] -> i32
+  (do
+    (println 42)
+    (println 100i64)
+    (println 3.14)
+    (println true)
+    (println false)
+    (print "answer=")
+    (println 42)
+    0))
