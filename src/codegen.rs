@@ -245,7 +245,89 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Ok(last)
             }
+            ExprKind::Cast { ty: to_ty, expr } => {
+                let from_ty = Self::expr_ty(expr)?.clone();
+                let v = self
+                    .emit_expr(expr)?
+                    .ok_or_else(|| CodegenError::Internal("cast expr".into()))?;
+                Ok(Some(self.emit_cast(v, &from_ty, to_ty)?))
+            }
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
+        }
+    }
+
+    fn emit_cast(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        from: &Type,
+        to: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        if from == to {
+            return Ok(v);
+        }
+        let llvm = |e: inkwell::builder::BuilderError| CodegenError::Llvm(e.to_string());
+        match (from, to) {
+            (Type::I32, Type::I64) => Ok(self
+                .builder
+                .build_int_s_extend(v.into_int_value(), self.context.i64_type(), "sext")
+                .map_err(llvm)?
+                .into()),
+            (Type::I64, Type::I32) => Ok(self
+                .builder
+                .build_int_truncate(v.into_int_value(), self.context.i32_type(), "trunc")
+                .map_err(llvm)?
+                .into()),
+            (Type::F32, Type::F64) => Ok(self
+                .builder
+                .build_float_ext(v.into_float_value(), self.context.f64_type(), "fpext")
+                .map_err(llvm)?
+                .into()),
+            (Type::F64, Type::F32) => Ok(self
+                .builder
+                .build_float_trunc(v.into_float_value(), self.context.f32_type(), "fptrunc")
+                .map_err(llvm)?
+                .into()),
+            (Type::I32, Type::F32) => Ok(self
+                .builder
+                .build_signed_int_to_float(v.into_int_value(), self.context.f32_type(), "sitofp")
+                .map_err(llvm)?
+                .into()),
+            (Type::I32, Type::F64) => Ok(self
+                .builder
+                .build_signed_int_to_float(v.into_int_value(), self.context.f64_type(), "sitofp")
+                .map_err(llvm)?
+                .into()),
+            (Type::I64, Type::F32) => Ok(self
+                .builder
+                .build_signed_int_to_float(v.into_int_value(), self.context.f32_type(), "sitofp")
+                .map_err(llvm)?
+                .into()),
+            (Type::I64, Type::F64) => Ok(self
+                .builder
+                .build_signed_int_to_float(v.into_int_value(), self.context.f64_type(), "sitofp")
+                .map_err(llvm)?
+                .into()),
+            (Type::F32, Type::I32) => Ok(self
+                .builder
+                .build_float_to_signed_int(v.into_float_value(), self.context.i32_type(), "fptosi")
+                .map_err(llvm)?
+                .into()),
+            (Type::F32, Type::I64) => Ok(self
+                .builder
+                .build_float_to_signed_int(v.into_float_value(), self.context.i64_type(), "fptosi")
+                .map_err(llvm)?
+                .into()),
+            (Type::F64, Type::I32) => Ok(self
+                .builder
+                .build_float_to_signed_int(v.into_float_value(), self.context.i32_type(), "fptosi")
+                .map_err(llvm)?
+                .into()),
+            (Type::F64, Type::I64) => Ok(self
+                .builder
+                .build_float_to_signed_int(v.into_float_value(), self.context.i64_type(), "fptosi")
+                .map_err(llvm)?
+                .into()),
+            _ => Err(CodegenError::Internal(format!("unsupported cast {from} -> {to}"))),
         }
     }
 

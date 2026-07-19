@@ -298,6 +298,19 @@ impl<'a> Parser<'a> {
                     Span::new(start, rp.span.end),
                 ))
             }
+            Some("as") => {
+                self.bump();
+                let ty = self.parse_type()?;
+                let expr = self.parse_expr()?;
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Cast {
+                        ty,
+                        expr: Box::new(expr),
+                    },
+                    Span::new(start, rp.span.end),
+                ))
+            }
             Some(_) | None => {
                 // generic call: callee must be ident
                 let callee_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
