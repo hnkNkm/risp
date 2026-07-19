@@ -750,6 +750,12 @@ impl<'a> Parser<'a> {
                         let _ = start;
                         Ok(Type::Ref(Box::new(inner)))
                     }
+                    "Box" => {
+                        let inner = self.parse_type()?;
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Box(Box::new(inner)))
+                    }
                     other => Err(ParseError::UnknownType(other.to_string(), head.span.start)),
                 }
             }
@@ -936,6 +942,17 @@ impl<'a> Parser<'a> {
                 let rp = self.eat(&Token::RParen)?;
                 Ok(Expr::new(
                     ExprKind::ArrayLit { elem_ty, elems },
+                    Span::new(start, rp.span.end),
+                ))
+            }
+            Some("box") => {
+                self.bump();
+                let expr = self.parse_expr()?;
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::BoxOf {
+                        expr: Box::new(expr),
+                    },
                     Span::new(start, rp.span.end),
                 ))
             }

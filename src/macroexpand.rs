@@ -118,6 +118,7 @@ fn expand_expr(
                 expand_expr(e, macros, depth)?;
             }
         }
+        ExprKind::BoxOf { expr } => expand_expr(expr, macros, depth)?,
         ExprKind::Field { base, .. } => expand_expr(base, macros, depth)?,
         ExprKind::Match { scrutinee, arms } => {
             expand_expr(scrutinee, macros, depth)?;
@@ -215,6 +216,9 @@ fn subst_expr(expr: &Expr, map: &HashMap<&str, &Expr>) -> Expr {
         ExprKind::ArrayLit { elem_ty, elems } => ExprKind::ArrayLit {
             elem_ty: elem_ty.clone(),
             elems: elems.iter().map(|e| subst_expr(e, map)).collect(),
+        },
+        ExprKind::BoxOf { expr } => ExprKind::BoxOf {
+            expr: Box::new(subst_expr(expr, map)),
         },
         ExprKind::Field { base, field } => ExprKind::Field {
             base: Box::new(subst_expr(base, map)),

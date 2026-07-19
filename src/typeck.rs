@@ -171,7 +171,7 @@ enum UseMode {
 }
 
 fn is_move_type(ty: &Type) -> bool {
-    matches!(ty, Type::Named(_))
+    matches!(ty, Type::Named(_) | Type::Box(_))
 }
 
 fn named_struct_of(ty: &Type) -> Option<&str> {
@@ -680,6 +680,7 @@ impl TypeCk {
             }
             Type::Array { elem, .. } => self.resolve_type(elem, span),
             Type::Ref(inner) => self.resolve_type(inner, span),
+            Type::Box(inner) => self.resolve_type(inner, span),
             _ => Ok(()),
         }
     }
@@ -701,6 +702,7 @@ impl TypeCk {
             }
             Type::Array { elem, .. } => self.resolve_type_with_params(elem, span, type_params),
             Type::Ref(inner) => self.resolve_type_with_params(inner, span, type_params),
+            Type::Box(inner) => self.resolve_type_with_params(inner, span, type_params),
             _ => Ok(()),
         }
     }
@@ -863,6 +865,17 @@ impl TypeCk {
                     elem: Box::new(elem_ty.clone()),
                     len: elems.len() as u32,
                 }
+            }
+            ExprKind::BoxOf { expr } => {
+                let inner = self.check_expr(expr, env, UseMode::Move)?;
+                if matches!(inner, Type::Unit | Type::Array { .. } | Type::Ref(_)) {
+                    return Err(TypeError::BadOperand {
+                        op: "box".into(),
+                        ty: inner,
+                        span,
+                    });
+                }
+                Type::Box(Box::new(inner))
             }
             ExprKind::Field { base, field } => {
                 let bt = self.check_expr(base, env, UseMode::Ref)?;
@@ -1115,6 +1128,13 @@ impl TypeCk {
                     });
                 }
                 let s = args[0].span;
+                if !matches!(args[0].kind, ExprKind::Var(_)) {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: Type::Unit,
+                        span: s,
+                    });
+                }
                 let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
                 match at {
                     Type::Named(_) => Ok(Type::Ref(Box::new(at))),
@@ -1338,6 +1358,26 @@ impl TypeCk {
                 }
                 Ok(Type::I32)
             }
+            "unbox" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
+                let Type::Box(inner) = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                Ok(*inner)
+            }
             _ => {
                 if self.generic_fns.contains_key(callee.as_str()) {
                     return self.check_generic_call(callee, args, env, call_span);
@@ -1484,6 +1524,7 @@ fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             len: *len,
         },
         Type::Ref(inner) => Type::Ref(Box::new(subst_type(inner, subst))),
+        Type::Box(inner) => Type::Box(Box::new(subst_type(inner, subst))),
         other => other.clone(),
     }
 }
@@ -1528,6 +1569,7 @@ fn subst_expr(e: &mut Expr, subst: &HashMap<String, Type>) {
                 subst_expr(el, subst);
             }
         }
+        ExprKind::BoxOf { expr } => subst_expr(expr, subst),
         ExprKind::Field { base, .. } => subst_expr(base, subst),
         ExprKind::Match { scrutinee, arms } => {
             subst_expr(scrutinee, subst);
@@ -1577,6 +1619,14 @@ fn unify_type_param(
         },
         Type::Ref(pe) => match concrete {
             Type::Ref(ce) => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        Type::Box(pe) => match concrete {
+            Type::Box(ce) => unify_type_param(pe, ce, type_params, subst, span),
             _ => Err(TypeError::Mismatch {
                 expected: pattern.clone(),
                 found: concrete.clone(),

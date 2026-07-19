@@ -1,0 +1,16 @@
+; Real borrow pointer: (borrow x) is a pointer; field uses GEP.
+;;! stdout: ok: borrow-ptr
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(defn sum-xy [r: (Ref Point)] -> i32
+  (+ (field r x) (field r y)))
+
+(defn main [] -> i32
+  (let [p: Point (Point 3 4)]
+    (if (= (sum-xy (borrow p)) 7)
+      (do
+        (println "ok: borrow-ptr")
+        (if (= (field p x) 3) 0 1))
+      (do (println "FAIL: borrow-ptr") 1))))

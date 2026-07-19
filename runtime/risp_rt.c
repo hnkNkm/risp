@@ -68,3 +68,15 @@ int risp_str_len(RispString *s) {
 const char *risp_str_cstr(RispString *s) {
     return s ? s->data : "";
 }
+
+void *risp_box_alloc(size_t size) {
+    void *p = malloc(size ? size : 1);
+    if (!p) {
+        abort();
+    }
+    return p;
+}
+
+void risp_box_free(void *p) {
+    free(p);
+}

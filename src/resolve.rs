@@ -416,6 +416,7 @@ fn rename_type_with_params(
         }
         Type::Array { elem, .. } => rename_type_with_params(elem, mod_name, globals, type_params),
         Type::Ref(inner) => rename_type_with_params(inner, mod_name, globals, type_params),
+        Type::Box(inner) => rename_type_with_params(inner, mod_name, globals, type_params),
         Type::I32
         | Type::I64
         | Type::F32
@@ -492,6 +493,7 @@ fn rename_expr(
                 rename_expr(e, mod_name, globals, locals);
             }
         }
+        ExprKind::BoxOf { expr } => rename_expr(expr, mod_name, globals, locals),
         ExprKind::Field { base, field: _ } => {
             rename_expr(base, mod_name, globals, locals);
         }

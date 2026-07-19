@@ -12,3 +12,6 @@ result-*
 /adt_smoke
 /enum_opt
 /struct_point
+/borrow_ptr
+/box_i32
+/struct_str
