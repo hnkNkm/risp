@@ -113,6 +113,11 @@ pub enum ExprKind {
     },
     /// `(do e1 e2 ... en)` — value is the last expr
     Do(Vec<Expr>),
+    /// `(as T e)` — numeric cast
+    Cast {
+        ty: Type,
+        expr: Box<Expr>,
+    },
     /// Function call or builtin operator: `(f a b ...)`
     Call {
         callee: String,

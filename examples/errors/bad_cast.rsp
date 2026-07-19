@@ -1,0 +1,6 @@
+; Cannot cast str to i32.
+;;! error_at: 6:3
+;;! error_contains: cannot cast
+
+(defn main [] -> i32
+  (as i32 "nope"))

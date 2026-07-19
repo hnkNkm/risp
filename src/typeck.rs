@@ -19,6 +19,8 @@ pub enum TypeError {
     BadOperand { op: String, ty: Type, span: Span },
     #[error("integer literal does not fit type {0}")]
     IntLitOverflow(Type, Span),
+    #[error("cannot cast from {from} to {to}")]
+    BadCast { from: Type, to: Type, span: Span },
     #[error("missing main function")]
     NoMain,
 }
@@ -32,7 +34,8 @@ impl TypeError {
             | TypeError::Mismatch { span: s, .. }
             | TypeError::Arity { span: s, .. }
             | TypeError::BadOperand { span: s, .. }
-            | TypeError::IntLitOverflow(_, s) => Some(*s),
+            | TypeError::IntLitOverflow(_, s)
+            | TypeError::BadCast { span: s, .. } => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -167,6 +170,14 @@ impl TypeCk {
                     last = self.check_expr(ex, env)?;
                 }
                 last
+            }
+            ExprKind::Cast { ty, expr } => {
+                let from = self.check_expr(expr, env)?;
+                let to = ty.clone();
+                if !cast_allowed(&from, &to) {
+                    return Err(TypeError::BadCast { from, to, span });
+                }
+                to
             }
             ExprKind::Call { callee, args } => {
                 let callee = callee.clone();
@@ -342,6 +353,10 @@ fn lit_type(l: &Lit) -> Type {
 
 fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::I32 | Type::I64 | Type::F32 | Type::F64)
+}
+
+fn cast_allowed(from: &Type, to: &Type) -> bool {
+    is_numeric(from) && is_numeric(to)
 }
 
 fn expect(expected: &Type, found: &Type, span: Span) -> Result<(), TypeError> {
