@@ -164,8 +164,10 @@ fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, String> {
         .map_err(|e| plain(e.to_string()))?;
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/risp_rt.c");
     let status = Command::new(&cc)
         .arg(&obj_path)
+        .arg(&runtime)
         .arg("-o")
         .arg(&out_path)
         .status()

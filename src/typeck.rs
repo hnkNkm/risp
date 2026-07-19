@@ -390,6 +390,36 @@ impl TypeCk {
                     }),
                 }
             }
+            "str-concat" => {
+                if args.len() != 2 {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 2,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                for a in args.iter_mut() {
+                    let s = a.span;
+                    let t = self.check_expr(a, env)?;
+                    expect(&Type::Str, &t, s)?;
+                }
+                Ok(Type::Str)
+            }
+            "str-len" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let s = args[0].span;
+                let t = self.check_expr(&mut args[0], env)?;
+                expect(&Type::Str, &t, s)?;
+                Ok(Type::I32)
+            }
             "aget" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {

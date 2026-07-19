@@ -80,6 +80,39 @@ impl<'ctx> Codegen<'ctx> {
         let printf_fn = self.module.add_function("printf", printf_ty, None);
         self.fns.insert("__printf".into(), printf_fn);
 
+        // Rc string runtime (see runtime/risp_rt.c)
+        let void_ty = self.context.void_type();
+        let from_ty = i8ptr_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_from_cstr".into(),
+            self.module.add_function("risp_str_from_cstr", from_ty, None),
+        );
+        let retain_ty = i8ptr_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_retain".into(),
+            self.module.add_function("risp_str_retain", retain_ty, None),
+        );
+        let release_ty = void_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_release".into(),
+            self.module.add_function("risp_str_release", release_ty, None),
+        );
+        let concat_ty = i8ptr_ty.fn_type(&[i8ptr_ty.into(), i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_concat".into(),
+            self.module.add_function("risp_str_concat", concat_ty, None),
+        );
+        let len_ty = i32_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_len".into(),
+            self.module.add_function("risp_str_len", len_ty, None),
+        );
+        let cstr_ty = i8ptr_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_str_cstr".into(),
+            self.module.add_function("risp_str_cstr", cstr_ty, None),
+        );
+
         // declare all user functions first (allow forward refs)
         for it in &prog.items {
             if let TopLevel::Function(f) = it {
@@ -218,7 +251,12 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let last = exprs.len() - 1;
                 for ex in &exprs[..last] {
-                    let _ = self.emit_expr(ex)?;
+                    let v = self.emit_expr(ex)?;
+                    if ex.ty.as_ref() == Some(&Type::Str) {
+                        if let Some(sv) = v {
+                            self.rt_str_release(sv.into_pointer_value())?;
+                        }
+                    }
                 }
                 self.emit_tail(&exprs[last], ret_ty)
             }
@@ -239,6 +277,9 @@ impl<'ctx> Codegen<'ctx> {
         ret_val: Option<BasicValueEnum<'ctx>>,
         ret_ty: &Type,
     ) -> Result<(), CodegenError> {
+        // Drop local Rc strings before returning. The return value (if `str`) is
+        // a separately owned reference produced by `emit_expr`.
+        self.release_str_locals()?;
         match (ret_ty, ret_val) {
             (Type::Unit, _) => {
                 self.builder
@@ -275,11 +316,27 @@ impl<'ctx> Codegen<'ctx> {
                 .ok_or_else(|| CodegenError::Internal("tco arg".into()))?;
             values.push(v);
         }
+        // Release non-parameter str locals before overwriting params / looping.
+        for (name, (ptr, ty)) in self.locals.clone() {
+            if ty == Type::Str && !self.param_locals.contains_key(&name) {
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let p = self
+                    .builder
+                    .build_load(ptr_ty, ptr, "tco.drop")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                    .into_pointer_value();
+                self.rt_str_release(p)?;
+            }
+        }
         for (name, v) in self.param_names.iter().zip(values) {
-            let (ptr, _) = self.param_locals[name];
-            self.builder
-                .build_store(ptr, v)
-                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            let (ptr, ty) = self.param_locals[name].clone();
+            if ty == Type::Str {
+                self.store_str(ptr, v.into_pointer_value())?;
+            } else {
+                self.builder
+                    .build_store(ptr, v)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            }
         }
         self.locals = self.param_locals.clone();
         let loop_bb = self
@@ -303,12 +360,97 @@ impl<'ctx> Codegen<'ctx> {
             return tmp_builder.build_alloca(at, name).unwrap();
         }
         let bt = basic_type(self.context, ty);
-        match bt {
+        let alloca = match bt {
             BasicTypeEnum::IntType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             BasicTypeEnum::FloatType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             BasicTypeEnum::PointerType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             _ => panic!("unsupported alloca type"),
+        };
+        // Rc strings start as null so release-before-store is safe.
+        if *ty == Type::Str {
+            let null = self.context.ptr_type(AddressSpace::default()).const_null();
+            tmp_builder.build_store(alloca, null).unwrap();
         }
+        alloca
+    }
+
+    fn rt_call_ptr1(
+        &self,
+        name: &str,
+        arg: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let f = self.fns[name];
+        let call = self
+            .builder
+            .build_call(f, &[arg.into()], name)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Internal(format!("{name} returned void")))?
+            .into_pointer_value())
+    }
+
+    fn rt_str_retain(&self, p: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, CodegenError> {
+        self.rt_call_ptr1("risp_str_retain", p)
+    }
+
+    fn rt_str_release(&self, p: PointerValue<'ctx>) -> Result<(), CodegenError> {
+        let f = self.fns["risp_str_release"];
+        self.builder
+            .build_call(f, &[p.into()], "risp_str_release")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(())
+    }
+
+    fn rt_str_from_cstr(&self, cstr: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, CodegenError> {
+        self.rt_call_ptr1("risp_str_from_cstr", cstr)
+    }
+
+    /// Store an owned `str` into an alloca, releasing the previous value.
+    fn store_str(
+        &self,
+        alloca: PointerValue<'ctx>,
+        new_owned: PointerValue<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let old = self
+            .builder
+            .build_load(ptr_ty, alloca, "oldstr")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_pointer_value();
+        self.rt_str_release(old)?;
+        self.builder
+            .build_store(alloca, new_owned)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load `str` from alloca and retain (returns owned).
+    fn load_str_owned(&self, alloca: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, CodegenError> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let p = self
+            .builder
+            .build_load(ptr_ty, alloca, "loadstr")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_pointer_value();
+        self.rt_str_retain(p)
+    }
+
+    /// Release all local `str` slots (function exit).
+    fn release_str_locals(&self) -> Result<(), CodegenError> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        for (ptr, ty) in self.locals.values() {
+            if *ty == Type::Str {
+                let p = self
+                    .builder
+                    .build_load(ptr_ty, *ptr, "dropstr")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                    .into_pointer_value();
+                self.rt_str_release(p)?;
+            }
+        }
+        Ok(())
     }
 
     fn expr_ty(e: &Expr) -> Result<&Type, CodegenError> {
@@ -319,12 +461,20 @@ impl<'ctx> Codegen<'ctx> {
     fn emit_expr(&mut self, e: &Expr) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
         let ty = Self::expr_ty(e)?.clone();
         match &e.kind {
-            ExprKind::Lit(l) => Ok(Some(self.emit_lit(l, &ty))),
+            ExprKind::Lit(l) => match l {
+                Lit::Str(s) => {
+                    let cstr = self.intern_str(s);
+                    Ok(Some(self.rt_str_from_cstr(cstr)?.into()))
+                }
+                _ => Ok(Some(self.emit_lit(l, &ty))),
+            },
             ExprKind::Var(name) => {
                 if let Some((ptr, vty)) = self.locals.get(name).cloned() {
                     // Array locals store the alloca address itself (no load).
                     if matches!(vty, Type::Array { .. }) {
                         Ok(Some(ptr.into()))
+                    } else if vty == Type::Str {
+                        Ok(Some(self.load_str_owned(ptr)?.into()))
                     } else {
                         let bt = basic_type(self.context, &vty);
                         let v = self
@@ -333,8 +483,15 @@ impl<'ctx> Codegen<'ctx> {
                             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
                         Ok(Some(v))
                     }
-                } else if let Some((_, v)) = self.consts.get(name) {
-                    Ok(Some(*v))
+                } else if let Some((cty, v)) = self.consts.get(name).cloned() {
+                    if cty == Type::Str {
+                        // Const holds a static cstr; build an owned Rc string.
+                        Ok(Some(
+                            self.rt_str_from_cstr(v.into_pointer_value())?.into(),
+                        ))
+                    } else {
+                        Ok(Some(v))
+                    }
                 } else {
                     Err(CodegenError::Internal(format!("unresolved var {name}")))
                 }
@@ -383,19 +540,37 @@ impl<'ctx> Codegen<'ctx> {
                     prev.push(self.bind_local(fv, b)?);
                 }
                 let result = self.emit_expr(body)?;
-                // restore
+                // Drop this scope's str bindings, then restore outer locals.
+                self.release_let_str_bindings(bindings)?;
                 for (name, p) in prev.into_iter().rev() {
                     match p {
-                        Some(x) => { self.locals.insert(name, x); }
-                        None => { self.locals.remove(&name); }
+                        Some(x) => {
+                            self.locals.insert(name, x);
+                        }
+                        None => {
+                            self.locals.remove(&name);
+                        }
                     }
                 }
                 Ok(result)
             }
             ExprKind::Do(exprs) => {
+                if exprs.is_empty() {
+                    return Ok(None);
+                }
+                let last_i = exprs.len() - 1;
                 let mut last: Option<BasicValueEnum<'ctx>> = None;
-                for ex in exprs {
-                    last = self.emit_expr(ex)?;
+                for (i, ex) in exprs.iter().enumerate() {
+                    let v = self.emit_expr(ex)?;
+                    if i != last_i {
+                        if ex.ty.as_ref() == Some(&Type::Str) {
+                            if let Some(sv) = v {
+                                self.rt_str_release(sv.into_pointer_value())?;
+                            }
+                        }
+                    } else {
+                        last = v;
+                    }
                 }
                 Ok(last)
             }
@@ -419,6 +594,8 @@ impl<'ctx> Codegen<'ctx> {
                     // Rebind the local to a new array pointer (no element-wise copy).
                     self.locals
                         .insert(name.clone(), (v.into_pointer_value(), vty));
+                } else if vty == Type::Str {
+                    self.store_str(ptr, v.into_pointer_value())?;
                 } else {
                     self.builder
                         .build_store(ptr, v)
@@ -437,6 +614,29 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn release_let_str_bindings(&self, bindings: &[Binding]) -> Result<(), CodegenError> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        for b in bindings.iter().rev() {
+            if b.ty != Type::Str {
+                continue;
+            }
+            let Some((ptr, _)) = self.locals.get(&b.name).cloned() else {
+                continue;
+            };
+            let p = self
+                .builder
+                .build_load(ptr_ty, ptr, "letscope.drop")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into_pointer_value();
+            self.rt_str_release(p)?;
+            let null = ptr_ty.const_null();
+            self.builder
+                .build_store(ptr, null)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Bind a `let` local. Arrays keep the pointer from the initializer (no copy).
     fn bind_local(
         &mut self,
@@ -448,6 +648,10 @@ impl<'ctx> Codegen<'ctx> {
             .ok_or_else(|| CodegenError::Internal("let value".into()))?;
         let ptr = if matches!(b.ty, Type::Array { .. }) {
             v.into_pointer_value()
+        } else if b.ty == Type::Str {
+            let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
+            self.store_str(alloca, v.into_pointer_value())?;
+            alloca
         } else {
             let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
             self.builder
@@ -707,6 +911,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.emit_print(args, false)?;
                 Ok(None)
             }
+            "str-concat" => Ok(Some(self.emit_str_concat(args)?.into())),
+            "str-len" => Ok(Some(self.emit_str_len(args)?.into())),
             "aget" => Ok(Some(self.emit_aget(args)?)),
             "aset!" => {
                 self.emit_aset(args)?;
@@ -883,19 +1089,27 @@ impl<'ctx> Codegen<'ctx> {
             .emit_expr(arg)?
             .ok_or_else(|| CodegenError::Internal("print arg".into()))?;
 
-        // Fast path: println of str → puts
-        if newline && ty == Type::Str {
-            let puts = self.fns["__puts"];
-            let argv: [BasicMetadataValueEnum; 1] = [v.into()];
-            self.builder
-                .build_call(puts, &argv, "putscall")
-                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        if ty == Type::Str {
+            let owned = v.into_pointer_value();
+            let cstr = self.rt_call_ptr1("risp_str_cstr", owned)?;
+            if newline {
+                let puts = self.fns["__puts"];
+                self.builder
+                    .build_call(puts, &[cstr.into()], "putscall")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            } else {
+                let fmt = self.intern_str("%s");
+                let printf = self.fns["__printf"];
+                self.builder
+                    .build_call(printf, &[fmt.into(), cstr.into()], "printfcall")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            }
+            self.rt_str_release(owned)?;
             return Ok(());
         }
 
         let printf = self.fns["__printf"];
         let (fmt, arg_v): (&str, BasicMetadataValueEnum) = match ty {
-            Type::Str => ("%s", v.into()),
             Type::I32 => ("%d", v.into()),
             Type::I64 => ("%lld", v.into()),
             Type::F64 => ("%g", v.into()),
@@ -916,7 +1130,7 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = selected.into_pointer_value();
                 ("%s", ptr.into())
             }
-            Type::Unit | Type::Array { .. } => {
+            Type::Str | Type::Unit | Type::Array { .. } => {
                 return Err(CodegenError::Internal("cannot print this type".into()));
             }
         };
@@ -931,6 +1145,52 @@ impl<'ctx> Codegen<'ctx> {
             .build_call(printf, &argv, "printfcall")
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         Ok(())
+    }
+
+    fn emit_str_concat(&mut self, args: &[Expr]) -> Result<PointerValue<'ctx>, CodegenError> {
+        let a = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("str-concat a".into()))?
+            .into_pointer_value();
+        let b = self
+            .emit_expr(&args[1])?
+            .ok_or_else(|| CodegenError::Internal("str-concat b".into()))?
+            .into_pointer_value();
+        let f = self.fns["risp_str_concat"];
+        let call = self
+            .builder
+            .build_call(f, &[a.into(), b.into()], "strconcat")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let out = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Internal("str-concat void".into()))?
+            .into_pointer_value();
+        self.rt_str_release(a)?;
+        self.rt_str_release(b)?;
+        Ok(out)
+    }
+
+    fn emit_str_len(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let s = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("str-len".into()))?
+            .into_pointer_value();
+        let f = self.fns["risp_str_len"];
+        let call = self
+            .builder
+            .build_call(f, &[s.into()], "strlen")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let n = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Internal("str-len void".into()))?
+            .into_int_value();
+        self.rt_str_release(s)?;
+        Ok(n)
     }
 
     fn emit_arith(
@@ -1025,6 +1285,7 @@ impl<'ctx> Codegen<'ctx> {
                 .bool_type()
                 .const_int(if *b { 1 } else { 0 }, false)
                 .into(),
+            // For `def` constants: store a static cstr; users convert via from_cstr.
             Lit::Str(s) => self.intern_str(s).into(),
         }
     }
