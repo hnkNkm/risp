@@ -415,6 +415,7 @@ fn rename_type_with_params(
             }
         }
         Type::Array { elem, .. } => rename_type_with_params(elem, mod_name, globals, type_params),
+        Type::Ref(inner) => rename_type_with_params(inner, mod_name, globals, type_params),
         Type::I32
         | Type::I64
         | Type::F32

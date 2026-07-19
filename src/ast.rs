@@ -34,6 +34,8 @@ pub enum Type {
     Array { elem: Box<Type>, len: u32 },
     /// User-defined struct or enum (by name).
     Named(String),
+    /// Shared borrow of `T`. Written `&T` in Display; parse as `(Ref T)`.
+    Ref(Box<Type>),
 }
 
 impl fmt::Display for Type {
@@ -48,6 +50,7 @@ impl fmt::Display for Type {
             Type::Unit => f.write_str("unit"),
             Type::Array { elem, len } => write!(f, "(Array {elem} {len})"),
             Type::Named(n) => f.write_str(n),
+            Type::Ref(inner) => write!(f, "&{inner}"),
         }
     }
 }

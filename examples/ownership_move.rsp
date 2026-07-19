@@ -1,0 +1,14 @@
+; Move a struct into a function by value.
+;;! stdout: ok: ownership
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(defn take-x [p: Point] -> i32
+  (field p x))
+
+(defn main [] -> i32
+  (let [p: Point (Point 1 2)]
+    (if (= (take-x p) 1)
+      (do (println "ok: ownership") 0)
+      (do (println "FAIL: ownership") 1))))

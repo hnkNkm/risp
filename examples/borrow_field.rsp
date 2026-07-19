@@ -1,0 +1,13 @@
+; Shared borrow does not move; field works on &T.
+;;! stdout: ok: borrow
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(defn main [] -> i32
+  (let [p: Point (Point 3 4)]
+    (if (= (+ (field (borrow p) x) (field (borrow p) y)) 7)
+      (do
+        (println "ok: borrow")
+        (if (= (field p x) 3) 0 1))
+      (do (println "FAIL: borrow") 1))))

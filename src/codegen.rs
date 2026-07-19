@@ -266,6 +266,8 @@ impl<'ctx> Codegen<'ctx> {
             Type::Named(n) if self.structs.contains_key(n) => self.llvm_struct_ty(n).into(),
             Type::Named(n) if self.enums.contains_key(n) => self.llvm_enum_ty().into(),
             Type::Named(n) => panic!("unknown named type {n}"),
+            // MVP: Ref is typeck-only; same LLVM representation as the pointee.
+            Type::Ref(inner) => self.llvm_basic(inner),
             Type::Unit => panic!("unit has no basic type"),
         }
     }
@@ -783,7 +785,10 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn emit_field(&mut self, base: &Expr, field: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        let base_ty = Self::expr_ty(base)?.clone();
+        let base_ty = match Self::expr_ty(base)? {
+            Type::Ref(inner) => inner.as_ref().clone(),
+            other => other.clone(),
+        };
         let Type::Named(ref n) = base_ty else {
             return Err(CodegenError::Internal("field on non-struct".into()));
         };
@@ -1366,6 +1371,8 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(None)
             }
             "alen" => Ok(Some(self.emit_alen(args)?.into())),
+            // MVP: borrow is identity at LLVM level (typeck-only Ref).
+            "borrow" => self.emit_expr(&args[0]),
             _ if self.structs.contains_key(callee) => {
                 Ok(Some(self.emit_struct_lit(callee, args)?))
             }
@@ -1603,7 +1610,7 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = selected.into_pointer_value();
                 ("%s", ptr.into())
             }
-            Type::Str | Type::Unit | Type::Array { .. } | Type::Named(_) => {
+            Type::Str | Type::Unit | Type::Array { .. } | Type::Named(_) | Type::Ref(_) => {
                 return Err(CodegenError::Internal("cannot print this type".into()));
             }
         };
