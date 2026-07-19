@@ -177,6 +177,30 @@ impl TypeCk {
         Ok(ty)
     }
 
+    /// Check that all args are the same numeric type; return that type.
+    fn check_numeric_args(
+        &self,
+        op: &str,
+        args: &mut [Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Result<Type, TypeError> {
+        let first_span = args[0].span;
+        let first = self.check_expr(&mut args[0], env)?;
+        if !is_numeric(&first) {
+            return Err(TypeError::BadOperand {
+                op: op.into(),
+                ty: first,
+                span: first_span,
+            });
+        }
+        for arg in args.iter_mut().skip(1) {
+            let s = arg.span;
+            let t = self.check_expr(arg, env)?;
+            expect(&first, &t, s)?;
+        }
+        Ok(first)
+    }
+
     fn check_call(
         &self,
         callee: &str,
@@ -186,21 +210,39 @@ impl TypeCk {
     ) -> Result<Type, TypeError> {
         // builtins first
         match callee {
-            "+" | "-" | "*" | "/" | "mod" => {
+            // `/` `mod` are binary-only; `+` `*` need ≥1 args; `-` is unary or n-ary (≥1).
+            "/" | "mod" => {
                 if args.len() != 2 {
-                    return Err(TypeError::Arity { name: callee.into(), expected: 2, got: args.len(), span: call_span });
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 2,
+                        got: args.len(),
+                        span: call_span,
+                    });
                 }
-                let a_span = args[0].span;
-                let a = self.check_expr(&mut args[0], env)?;
-                let b_span = args[1].span;
-                let b = self.check_expr(&mut args[1], env)?;
-                if a != b {
-                    return Err(TypeError::Mismatch { expected: a, found: b, span: b_span });
+                self.check_numeric_args(callee, args, env)
+            }
+            "+" | "*" => {
+                if args.is_empty() {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 1,
+                        got: 0,
+                        span: call_span,
+                    });
                 }
-                if !is_numeric(&a) {
-                    return Err(TypeError::BadOperand { op: callee.into(), ty: a, span: a_span });
+                self.check_numeric_args(callee, args, env)
+            }
+            "-" => {
+                if args.is_empty() {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 1,
+                        got: 0,
+                        span: call_span,
+                    });
                 }
-                Ok(a)
+                self.check_numeric_args(callee, args, env)
             }
             "<" | "<=" | ">" | ">=" | "=" | "!=" => {
                 if args.len() != 2 {

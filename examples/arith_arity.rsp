@@ -1,0 +1,16 @@
+; Unary minus and n-ary + / - / *.
+;;! stdout: ok: arith arity
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [neg: i32 (- 5)
+        sum: i32 (+ 1 2 3)
+        prod: i32 (* 2 3 4)
+        diff: i32 (- 10 3 2)
+        id: i32 (+ 42)]
+    (if (and (= neg -5)
+             (and (= sum 6)
+                  (and (= prod 24)
+                       (and (= diff 5) (= id 42)))))
+      (do (println "ok: arith arity") 0)
+      (do (println "FAIL: arith arity") 1))))
