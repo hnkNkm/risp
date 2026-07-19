@@ -1,0 +1,12 @@
+; Use of a moved Named local is a type error.
+;;! error_at: 12:25
+;;! error_contains: use of moved value
+
+(struct Point [x: i32, y: i32])
+
+(defn take [p: Point] -> i32
+  (field p x))
+
+(defn main [] -> i32
+  (let [p: Point (Point 1 2)]
+    (do (take p) (field p x))))

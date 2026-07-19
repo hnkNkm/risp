@@ -41,13 +41,16 @@ ok: f64 cmp
 | `bool` | 真偽値 |
 | `str` | 動的文字列（参照カウント / `runtime/risp_rt.c`） |
 | `(Array T N)` | 固定長配列（要素は数値 / `bool`。ローカルのみ。代入は参照意味論） |
-| 名前付き型 | `struct` / `enum`（フィールド・ペイロードは数値 / `bool` のみ） |
+| 名前付き型 | `struct` / `enum`（フィールド・ペイロードは数値 / `bool` のみ）。値渡しでムーブ |
+| `(Ref T)` / `&T` | 共有借用（型検査のみ。LLVM 上は `T` と同じ表現）。`(borrow e)` で生成 |
 
 ### メモリ管理
 
-- 数値・`bool`・固定長配列・`struct` / `enum` は値 / スタック
-- **`str` は参照カウント**（C ランタイム `risp_str_*`）。GC ではなく Rc 方針（将来の所有権検査へ寄せやすい）
-- 借用チェッカ（Rust的所有権）は未導入（Phase 5）
+- 数値・`bool`・固定長配列・`str`（Rc）・`unit` は **Copy**（使用してもムーブしない）
+- `struct` / `enum`（`Named`）は **ムーブ**（値渡し・`let` 束縛などで消費後は再利用不可）
+- `(borrow e)` で共有借用 `&T`（ムーブしない。複数回可）。`(field e f)` は `T` / `&T` 両対応
+- 関数から `Ref` は返せない（ライフタイム未対応）。参照からのムーブアウトも不可
+- **`str` は参照カウント**（C ランタイム `risp_str_*`）
 
 ### 構文
 
@@ -173,6 +176,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | ループ | `(while cond body)` / `(loop body)` / `(break)`（値は Unit） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
+| 所有権 | `(borrow e)` → `&T`（共有借用。Named をムーブしない）。ムーブ後の再利用は型エラー |
 | trait | `(trait Name (method [self ...] -> T)*)` / `(impl Name for T ...)`（静的ディスパッチ。先頭引数は bare `self` 可） |
 | ジェネリクス | `(defn f [T] [x: T] -> T ...)` / `(defn f [T: Trait] [x: T] -> ...)`（呼び出し時に単相化。struct/enum は未対応） |
 | マクロ | `(defmacro name [params] template)`（型検査前に Call をテンプレートへ置換。非衛生的） |
@@ -319,7 +323,7 @@ cargo run -- run examples/hello.rsp
 - [x] モジュール（`(import name)` / 修飾名 `mod/f` MVP）
 
 ### Phase 5 — Nice to have
-- [ ] 所有権・借用検査
+- [x] 所有権・借用検査（MVP: Named ムーブ / `(borrow)` 共有参照 / field の auto-deref。ライフタイムなし）
 - [x] FFI（`(extern "C" …)`）
 - [ ] モジュール検索パスの拡張 / 再エクスポート
 

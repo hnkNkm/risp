@@ -716,34 +716,42 @@ impl<'a> Parser<'a> {
                         return Err(ParseError::Unexpected(format!("{:?}", other), head.span.start));
                     }
                 };
-                if head_name != "Array" {
-                    return Err(ParseError::UnknownType(head_name.to_string(), head.span.start));
+                match head_name {
+                    "Array" => {
+                        let elem = self.parse_type()?;
+                        let len_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                        let len = match &len_tok.tok {
+                            Token::Int(v, _) if *v >= 0 && *v <= u32::MAX as i64 => *v as u32,
+                            Token::Int(..) => {
+                                return Err(ParseError::Expected {
+                                    expected: "non-negative array length fitting u32",
+                                    found: format!("{:?}", len_tok.tok),
+                                    at: len_tok.span.start,
+                                });
+                            }
+                            other => {
+                                return Err(ParseError::Expected {
+                                    expected: "array length (int literal)",
+                                    found: format!("{:?}", other),
+                                    at: len_tok.span.start,
+                                });
+                            }
+                        };
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Array {
+                            elem: Box::new(elem),
+                            len,
+                        })
+                    }
+                    "Ref" => {
+                        let inner = self.parse_type()?;
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Ref(Box::new(inner)))
+                    }
+                    other => Err(ParseError::UnknownType(other.to_string(), head.span.start)),
                 }
-                let elem = self.parse_type()?;
-                let len_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
-                let len = match &len_tok.tok {
-                    Token::Int(v, _) if *v >= 0 && *v <= u32::MAX as i64 => *v as u32,
-                    Token::Int(..) => {
-                        return Err(ParseError::Expected {
-                            expected: "non-negative array length fitting u32",
-                            found: format!("{:?}", len_tok.tok),
-                            at: len_tok.span.start,
-                        });
-                    }
-                    other => {
-                        return Err(ParseError::Expected {
-                            expected: "array length (int literal)",
-                            found: format!("{:?}", other),
-                            at: len_tok.span.start,
-                        });
-                    }
-                };
-                self.eat(&Token::RParen)?;
-                let _ = start;
-                Ok(Type::Array {
-                    elem: Box::new(elem),
-                    len,
-                })
             }
             other => Err(ParseError::Unexpected(format!("{:?}", other), t.span.start)),
         }

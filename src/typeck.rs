@@ -89,6 +89,12 @@ pub enum TypeError {
     TraitCallNoReceiver(Span),
     #[error("cannot infer type parameter {0:?}")]
     InferTypeParam(String, Span),
+    #[error("use of moved value {0:?}")]
+    UseAfterMove(String, Span),
+    #[error("cannot return a reference type (no lifetimes yet)")]
+    CannotReturnRef(Span),
+    #[error("cannot move out of a reference")]
+    MoveOutOfRef(Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -131,9 +137,78 @@ impl TypeError {
             | TypeError::AmbiguousTraitMethod(_, s)
             | TypeError::UndefinedTrait(_, s)
             | TypeError::TraitCallNoReceiver(s)
-            | TypeError::InferTypeParam(_, s) => Some(*s),
+            | TypeError::InferTypeParam(_, s)
+            | TypeError::UseAfterMove(_, s)
+            | TypeError::CannotReturnRef(s)
+            | TypeError::MoveOutOfRef(s) => Some(*s),
             TypeError::NoMain => None,
         }
+    }
+}
+
+/// Local binding with move-tracking for Named (struct/enum) types.
+#[derive(Debug, Clone)]
+struct Local {
+    ty: Type,
+    moved: bool,
+}
+
+impl Local {
+    fn new(ty: Type) -> Self {
+        Self { ty, moved: false }
+    }
+}
+
+type Env = HashMap<String, Local>;
+
+/// How a value is consumed at an expression position.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UseMode {
+    /// Value is consumed (moves Named locals).
+    Move,
+    /// Place is only borrowed / projected (field, `borrow`); does not move.
+    Ref,
+}
+
+fn is_move_type(ty: &Type) -> bool {
+    matches!(ty, Type::Named(_))
+}
+
+fn named_struct_of(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Named(n) => Some(n.as_str()),
+        Type::Ref(inner) => match inner.as_ref() {
+            Type::Named(n) => Some(n.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Like `expect`, but reports move-out-of-ref when Owned Named is required and `&T` is given.
+fn expect_arg(expected: &Type, found: &Type, span: Span) -> Result<(), TypeError> {
+    if expected == found {
+        return Ok(());
+    }
+    if is_move_type(expected) {
+        if let Type::Ref(inner) = found {
+            if inner.as_ref() == expected {
+                return Err(TypeError::MoveOutOfRef(span));
+            }
+        }
+    }
+    Err(TypeError::Mismatch {
+        expected: expected.clone(),
+        found: found.clone(),
+        span,
+    })
+}
+
+fn reject_ref_return(ty: &Type, span: Span) -> Result<(), TypeError> {
+    if matches!(ty, Type::Ref(_)) {
+        Err(TypeError::CannotReturnRef(span))
+    } else {
+        Ok(())
     }
 }
 
@@ -326,6 +401,7 @@ impl TypeCk {
                     if matches!(m.ret, Type::Array { .. }) {
                         return Err(TypeError::ArrayInSignature(m.span));
                     }
+                    reject_ref_return(&m.ret, m.span)?;
                     self.trait_methods.insert(m.name.clone(), t.name.clone());
                 }
                 self.traits.insert(t.name.clone(), t.clone());
@@ -347,6 +423,7 @@ impl TypeCk {
                     if matches!(f.ret, Type::Array { .. }) {
                         return Err(TypeError::ArrayInSignature(f.span));
                     }
+                    reject_ref_return(&f.ret, f.span)?;
                     let sig = FnSig {
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: f.ret.clone(),
@@ -376,6 +453,7 @@ impl TypeCk {
                     if matches!(g.ret, Type::Array { .. }) {
                         return Err(TypeError::ArrayInSignature(g.span));
                     }
+                    reject_ref_return(&g.ret, g.span)?;
                     self.generic_fns.insert(g.name.clone(), g.clone());
                 }
                 TopLevel::Extern(e) => {
@@ -492,6 +570,7 @@ impl TypeCk {
                     if matches!(m.ret, Type::Array { .. }) {
                         return Err(TypeError::ArrayInSignature(m.span));
                     }
+                    reject_ref_return(&m.ret, m.span)?;
 
                     let mangled = mangle_method(&ib.trait_name, &ib.for_ty, &m.name);
                     let sig = FnSig {
@@ -528,22 +607,22 @@ impl TypeCk {
         for it in &mut prog.items {
             match it {
                 TopLevel::Function(f) => {
-                    let mut env: HashMap<String, Type> = HashMap::new();
+                    let mut env: Env = HashMap::new();
                     for p in &f.params {
-                        env.insert(p.name.clone(), p.ty.clone());
+                        env.insert(p.name.clone(), Local::new(p.ty.clone()));
                     }
                     let body_span = f.body.span;
-                    let body_ty = self.check_expr(&mut f.body, &mut env)?;
+                    let body_ty = self.check_expr(&mut f.body, &mut env, UseMode::Move)?;
                     expect(&f.ret, &body_ty, body_span)?;
                 }
                 TopLevel::Impl(ib) => {
                     for m in &mut ib.methods {
-                        let mut env: HashMap<String, Type> = HashMap::new();
+                        let mut env: Env = HashMap::new();
                         for p in &m.params {
-                            env.insert(p.name.clone(), p.ty.clone());
+                            env.insert(p.name.clone(), Local::new(p.ty.clone()));
                         }
                         let body_span = m.body.span;
-                        let body_ty = self.check_expr(&mut m.body, &mut env)?;
+                        let body_ty = self.check_expr(&mut m.body, &mut env, UseMode::Move)?;
                         expect(&m.ret, &body_ty, body_span)?;
                     }
                 }
@@ -551,9 +630,9 @@ impl TypeCk {
                     if !matches!(c.value.kind, ExprKind::Lit(_)) {
                         return Err(TypeError::ConstNotLiteral(c.value.span));
                     }
-                    let mut env = HashMap::new();
+                    let mut env: Env = HashMap::new();
                     let val_span = c.value.span;
-                    let ty = self.check_expr(&mut c.value, &mut env)?;
+                    let ty = self.check_expr(&mut c.value, &mut env, UseMode::Move)?;
                     expect(&c.ty, &ty, val_span)?;
                 }
                 TopLevel::Struct(_)
@@ -600,6 +679,7 @@ impl TypeCk {
                 }
             }
             Type::Array { elem, .. } => self.resolve_type(elem, span),
+            Type::Ref(inner) => self.resolve_type(inner, span),
             _ => Ok(()),
         }
     }
@@ -620,6 +700,7 @@ impl TypeCk {
                 }
             }
             Type::Array { elem, .. } => self.resolve_type_with_params(elem, span, type_params),
+            Type::Ref(inner) => self.resolve_type_with_params(inner, span, type_params),
             _ => Ok(()),
         }
     }
@@ -627,7 +708,8 @@ impl TypeCk {
     fn check_expr(
         &mut self,
         e: &mut Expr,
-        env: &mut HashMap<String, Type>,
+        env: &mut Env,
+        mode: UseMode,
     ) -> Result<Type, TypeError> {
         let span = e.span;
         let ty = match &mut e.kind {
@@ -641,8 +723,15 @@ impl TypeCk {
                 ty
             }
             ExprKind::Var(name) => {
-                if let Some(t) = env.get(name) {
-                    t.clone()
+                if let Some(local) = env.get(name) {
+                    if local.moved {
+                        return Err(TypeError::UseAfterMove(name.clone(), span));
+                    }
+                    let ty = local.ty.clone();
+                    if mode == UseMode::Move && is_move_type(&ty) {
+                        env.get_mut(name).unwrap().moved = true;
+                    }
+                    ty
                 } else if let Some(t) = self.consts.get(name) {
                     t.clone()
                 } else {
@@ -655,11 +744,21 @@ impl TypeCk {
                 else_branch,
             } => {
                 let cond_span = cond.span;
-                let ct = self.check_expr(cond, env)?;
+                let ct = self.check_expr(cond, env, UseMode::Move)?;
                 expect(&Type::Bool, &ct, cond_span)?;
-                let tt = self.check_expr(then_branch, env)?;
+                let before = env.clone();
+                let tt = self.check_expr(then_branch, env, mode)?;
+                let after_then = env.clone();
+                *env = before.clone();
                 let et_span = else_branch.span;
-                let et = self.check_expr(else_branch, env)?;
+                let et = self.check_expr(else_branch, env, mode)?;
+                let after_else = env.clone();
+                *env = before;
+                for (name, local) in env.iter_mut() {
+                    let a = after_then.get(name).map(|l| l.moved).unwrap_or(false);
+                    let b = after_else.get(name).map(|l| l.moved).unwrap_or(false);
+                    local.moved = a || b;
+                }
                 if tt != et {
                     return Err(TypeError::Mismatch {
                         expected: tt,
@@ -670,18 +769,18 @@ impl TypeCk {
                 tt
             }
             ExprKind::Let { bindings, body } => {
-                let snapshot: Vec<(String, Option<Type>)> = bindings
+                let snapshot: Vec<(String, Option<Local>)> = bindings
                     .iter()
                     .map(|b| (b.name.clone(), env.get(&b.name).cloned()))
                     .collect();
                 for b in bindings.iter_mut() {
                     self.resolve_type(&b.ty, b.span)?;
                     let val_span = b.value.span;
-                    let vt = self.check_expr(&mut b.value, env)?;
+                    let vt = self.check_expr(&mut b.value, env, UseMode::Move)?;
                     expect(&b.ty, &vt, val_span)?;
-                    env.insert(b.name.clone(), b.ty.clone());
+                    env.insert(b.name.clone(), Local::new(b.ty.clone()));
                 }
-                let bt = self.check_expr(body, env)?;
+                let bt = self.check_expr(body, env, mode)?;
                 for (name, prev) in snapshot {
                     match prev {
                         Some(t) => {
@@ -696,13 +795,15 @@ impl TypeCk {
             }
             ExprKind::Do(exprs) => {
                 let mut last = Type::Unit;
-                for ex in exprs.iter_mut() {
-                    last = self.check_expr(ex, env)?;
+                let n = exprs.len();
+                for (i, ex) in exprs.iter_mut().enumerate() {
+                    let m = if i + 1 == n { mode } else { UseMode::Move };
+                    last = self.check_expr(ex, env, m)?;
                 }
                 last
             }
             ExprKind::Cast { ty, expr } => {
-                let from = self.check_expr(expr, env)?;
+                let from = self.check_expr(expr, env, UseMode::Move)?;
                 let to = ty.clone();
                 if !cast_allowed(&from, &to) {
                     return Err(TypeError::BadCast { from, to, span });
@@ -710,31 +811,35 @@ impl TypeCk {
                 to
             }
             ExprKind::Set { name, value } => {
-                let expected = if let Some(t) = env.get(name) {
-                    t.clone()
+                let expected = if let Some(local) = env.get(name) {
+                    local.ty.clone()
                 } else if self.consts.contains_key(name) {
                     return Err(TypeError::AssignConst(name.clone(), span));
                 } else {
                     return Err(TypeError::UndefinedVar(name.clone(), span));
                 };
                 let val_span = value.span;
-                let vt = self.check_expr(value, env)?;
+                let vt = self.check_expr(value, env, UseMode::Move)?;
                 expect(&expected, &vt, val_span)?;
+                // Rebind: clear moved state for this local.
+                if let Some(local) = env.get_mut(name) {
+                    local.moved = false;
+                }
                 Type::Unit
             }
             ExprKind::While { cond, body } => {
                 let cond_span = cond.span;
-                let ct = self.check_expr(cond, env)?;
+                let ct = self.check_expr(cond, env, UseMode::Move)?;
                 expect(&Type::Bool, &ct, cond_span)?;
                 self.loop_depth += 1;
-                let body_res = self.check_expr(body, env);
+                let body_res = self.check_expr(body, env, UseMode::Move);
                 self.loop_depth -= 1;
                 let _ = body_res?;
                 Type::Unit
             }
             ExprKind::Loop { body } => {
                 self.loop_depth += 1;
-                let body_res = self.check_expr(body, env);
+                let body_res = self.check_expr(body, env, UseMode::Move);
                 self.loop_depth -= 1;
                 let _ = body_res?;
                 Type::Unit
@@ -751,7 +856,7 @@ impl TypeCk {
                 }
                 for el in elems.iter_mut() {
                     let s = el.span;
-                    let t = self.check_expr(el, env)?;
+                    let t = self.check_expr(el, env, UseMode::Move)?;
                     expect(elem_ty, &t, s)?;
                 }
                 Type::Array {
@@ -760,11 +865,12 @@ impl TypeCk {
                 }
             }
             ExprKind::Field { base, field } => {
-                let bt = self.check_expr(base, env)?;
-                let Type::Named(ref n) = bt else {
+                let bt = self.check_expr(base, env, UseMode::Ref)?;
+                let Some(n) = named_struct_of(&bt) else {
                     return Err(TypeError::FieldOnNonStruct(bt, span));
                 };
-                let Some(sdef) = self.structs.get(n) else {
+                let n = n.to_string();
+                let Some(sdef) = self.structs.get(&n) else {
                     return Err(TypeError::FieldOnNonStruct(bt, span));
                 };
                 let Some(f) = sdef.fields.iter().find(|f| f.name == *field) else {
@@ -772,7 +878,9 @@ impl TypeCk {
                 };
                 f.ty.clone()
             }
-            ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, env, span)?,
+            ExprKind::Match { scrutinee, arms } => {
+                self.check_match(scrutinee, arms, env, span, mode)?
+            }
             ExprKind::Call { callee, args } => self.check_call(callee, args, env, span)?,
         };
         e.ty = Some(ty.clone());
@@ -783,10 +891,11 @@ impl TypeCk {
         &mut self,
         scrutinee: &mut Expr,
         arms: &mut [MatchArm],
-        env: &mut HashMap<String, Type>,
+        env: &mut Env,
         span: Span,
+        mode: UseMode,
     ) -> Result<Type, TypeError> {
-        let st = self.check_expr(scrutinee, env)?;
+        let st = self.check_expr(scrutinee, env, UseMode::Move)?;
         let Type::Named(ref ename) = st else {
             return Err(TypeError::MatchNonEnum(st, span));
         };
@@ -796,8 +905,11 @@ impl TypeCk {
 
         let mut seen = HashSet::new();
         let mut result_ty: Option<Type> = None;
+        let before = env.clone();
+        let mut moved_union: HashMap<String, bool> = HashMap::new();
 
         for arm in arms.iter_mut() {
+            *env = before.clone();
             let info = self
                 .variants
                 .get(&arm.variant)
@@ -825,13 +937,18 @@ impl TypeCk {
             }
 
             let prev = if let (Some(pty), Some(bname)) = (&info.payload, &arm.binding) {
-                let prev = env.insert(bname.clone(), pty.clone());
+                let prev = env.insert(bname.clone(), Local::new(pty.clone()));
                 Some((bname.clone(), prev))
             } else {
                 None
             };
 
-            let bt = self.check_expr(&mut arm.body, env)?;
+            let bt = self.check_expr(&mut arm.body, env, mode)?;
+            for (name, local) in env.iter() {
+                if before.contains_key(name) && local.moved {
+                    *moved_union.entry(name.clone()).or_insert(false) = true;
+                }
+            }
             if let Some((bname, prev)) = prev {
                 match prev {
                     Some(t) => {
@@ -849,6 +966,15 @@ impl TypeCk {
             }
         }
 
+        *env = before;
+        for (name, moved) in moved_union {
+            if let Some(local) = env.get_mut(&name) {
+                if moved {
+                    local.moved = true;
+                }
+            }
+        }
+
         for v in &edef.variants {
             if !seen.contains(&v.name) {
                 return Err(TypeError::MatchNonExhaustive(v.name.clone(), span));
@@ -863,10 +989,10 @@ impl TypeCk {
         &mut self,
         op: &str,
         args: &mut [Expr],
-        env: &mut HashMap<String, Type>,
+        env: &mut Env,
     ) -> Result<Type, TypeError> {
         let first_span = args[0].span;
-        let first = self.check_expr(&mut args[0], env)?;
+        let first = self.check_expr(&mut args[0], env, UseMode::Move)?;
         if !is_numeric(&first) {
             return Err(TypeError::BadOperand {
                 op: op.into(),
@@ -876,7 +1002,7 @@ impl TypeCk {
         }
         for arg in args.iter_mut().skip(1) {
             let s = arg.span;
-            let t = self.check_expr(arg, env)?;
+            let t = self.check_expr(arg, env, UseMode::Move)?;
             expect(&first, &t, s)?;
         }
         Ok(first)
@@ -886,7 +1012,7 @@ impl TypeCk {
         &mut self,
         callee: &mut String,
         args: &mut [Expr],
-        env: &mut HashMap<String, Type>,
+        env: &mut Env,
         call_span: Span,
     ) -> Result<Type, TypeError> {
         // Trait method: resolve impl by first arg type and rewrite callee to mangled name.
@@ -894,7 +1020,7 @@ impl TypeCk {
             if args.is_empty() {
                 return Err(TypeError::TraitCallNoReceiver(call_span));
             }
-            let recv_ty = self.check_expr(&mut args[0], env)?;
+            let recv_ty = self.check_expr(&mut args[0], env, UseMode::Move)?;
             if !self.impls.contains(&(trait_name.clone(), recv_ty.clone())) {
                 return Err(TypeError::MissingImpl {
                     trait_name,
@@ -917,11 +1043,11 @@ impl TypeCk {
                 });
             }
             // Receiver already checked; remaining args against mangled sig.
-            expect(&sig.params[0], &recv_ty, args[0].span)?;
+            expect_arg(&sig.params[0], &recv_ty, args[0].span)?;
             for (param_ty, arg) in sig.params.iter().skip(1).zip(args.iter_mut().skip(1)) {
                 let s = arg.span;
-                let at = self.check_expr(arg, env)?;
-                expect(param_ty, &at, s)?;
+                let at = self.check_expr(arg, env, UseMode::Move)?;
+                expect_arg(param_ty, &at, s)?;
             }
             *callee = mangled;
             return Ok(sig.ret.clone());
@@ -940,7 +1066,7 @@ impl TypeCk {
             }
             for (field, arg) in sdef.fields.iter().zip(args.iter_mut()) {
                 let s = arg.span;
-                let at = self.check_expr(arg, env)?;
+                let at = self.check_expr(arg, env, UseMode::Move)?;
                 expect(&field.ty, &at, s)?;
             }
             return Ok(Type::Named(sdef.name));
@@ -970,7 +1096,7 @@ impl TypeCk {
                         });
                     }
                     let s = args[0].span;
-                    let at = self.check_expr(&mut args[0], env)?;
+                    let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
                     expect(pty, &at, s)?;
                 }
             }
@@ -979,6 +1105,26 @@ impl TypeCk {
 
         // builtins first
         match callee.as_str() {
+            "borrow" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let s = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                match at {
+                    Type::Named(_) => Ok(Type::Ref(Box::new(at))),
+                    other => Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: other,
+                        span: s,
+                    }),
+                }
+            }
             "/" | "mod" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
@@ -1022,9 +1168,9 @@ impl TypeCk {
                     });
                 }
                 let a_span = args[0].span;
-                let a = self.check_expr(&mut args[0], env)?;
+                let a = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 let b_span = args[1].span;
-                let b = self.check_expr(&mut args[1], env)?;
+                let b = self.check_expr(&mut args[1], env, UseMode::Move)?;
                 if a != b {
                     return Err(TypeError::Mismatch {
                         expected: a,
@@ -1052,7 +1198,7 @@ impl TypeCk {
                 }
                 for a in args.iter_mut() {
                     let s = a.span;
-                    let t = self.check_expr(a, env)?;
+                    let t = self.check_expr(a, env, UseMode::Move)?;
                     expect(&Type::Bool, &t, s)?;
                 }
                 Ok(Type::Bool)
@@ -1067,7 +1213,7 @@ impl TypeCk {
                     });
                 }
                 let s = args[0].span;
-                let t = self.check_expr(&mut args[0], env)?;
+                let t = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 expect(&Type::Bool, &t, s)?;
                 Ok(Type::Bool)
             }
@@ -1081,7 +1227,7 @@ impl TypeCk {
                     });
                 }
                 let s = args[0].span;
-                let t = self.check_expr(&mut args[0], env)?;
+                let t = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 match t {
                     Type::Str | Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool => {
                         Ok(Type::Unit)
@@ -1104,7 +1250,7 @@ impl TypeCk {
                 }
                 for a in args.iter_mut() {
                     let s = a.span;
-                    let t = self.check_expr(a, env)?;
+                    let t = self.check_expr(a, env, UseMode::Move)?;
                     expect(&Type::Str, &t, s)?;
                 }
                 Ok(Type::Str)
@@ -1119,7 +1265,7 @@ impl TypeCk {
                     });
                 }
                 let s = args[0].span;
-                let t = self.check_expr(&mut args[0], env)?;
+                let t = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 expect(&Type::Str, &t, s)?;
                 Ok(Type::I32)
             }
@@ -1133,7 +1279,7 @@ impl TypeCk {
                     });
                 }
                 let a_span = args[0].span;
-                let at = self.check_expr(&mut args[0], env)?;
+                let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 let Type::Array { elem, .. } = at else {
                     return Err(TypeError::BadOperand {
                         op: callee.clone(),
@@ -1142,7 +1288,7 @@ impl TypeCk {
                     });
                 };
                 let i_span = args[1].span;
-                let it = self.check_expr(&mut args[1], env)?;
+                let it = self.check_expr(&mut args[1], env, UseMode::Move)?;
                 expect(&Type::I32, &it, i_span)?;
                 Ok(*elem)
             }
@@ -1156,7 +1302,7 @@ impl TypeCk {
                     });
                 }
                 let a_span = args[0].span;
-                let at = self.check_expr(&mut args[0], env)?;
+                let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 let Type::Array { elem, .. } = at else {
                     return Err(TypeError::BadOperand {
                         op: callee.clone(),
@@ -1165,10 +1311,10 @@ impl TypeCk {
                     });
                 };
                 let i_span = args[1].span;
-                let it = self.check_expr(&mut args[1], env)?;
+                let it = self.check_expr(&mut args[1], env, UseMode::Move)?;
                 expect(&Type::I32, &it, i_span)?;
                 let v_span = args[2].span;
-                let vt = self.check_expr(&mut args[2], env)?;
+                let vt = self.check_expr(&mut args[2], env, UseMode::Move)?;
                 expect(&elem, &vt, v_span)?;
                 Ok(Type::Unit)
             }
@@ -1182,7 +1328,7 @@ impl TypeCk {
                     });
                 }
                 let a_span = args[0].span;
-                let at = self.check_expr(&mut args[0], env)?;
+                let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
                 if !matches!(at, Type::Array { .. }) {
                     return Err(TypeError::BadOperand {
                         op: callee.clone(),
@@ -1211,8 +1357,8 @@ impl TypeCk {
                 }
                 for (param_ty, arg) in sig.params.iter().zip(args.iter_mut()) {
                     let s = arg.span;
-                    let at = self.check_expr(arg, env)?;
-                    expect(param_ty, &at, s)?;
+                    let at = self.check_expr(arg, env, UseMode::Move)?;
+                    expect_arg(param_ty, &at, s)?;
                 }
                 Ok(sig.ret.clone())
             }
@@ -1223,7 +1369,7 @@ impl TypeCk {
         &mut self,
         callee: &mut String,
         args: &mut [Expr],
-        env: &mut HashMap<String, Type>,
+        env: &mut Env,
         call_span: Span,
     ) -> Result<Type, TypeError> {
         let g = self.generic_fns[callee.as_str()].clone();
@@ -1241,7 +1387,7 @@ impl TypeCk {
         let mut arg_tys = Vec::with_capacity(args.len());
         for (param, arg) in g.params.iter().zip(args.iter_mut()) {
             let s = arg.span;
-            let at = self.check_expr(arg, env)?;
+            let at = self.check_expr(arg, env, UseMode::Move)?;
             unify_type_param(&param.ty, &at, &tp_names, &mut subst, s)?;
             arg_tys.push(at);
         }
@@ -1270,7 +1416,7 @@ impl TypeCk {
             .iter()
             .zip(args.iter().zip(arg_tys.iter()))
         {
-            expect(param_ty, at, arg.span)?;
+            expect_arg(param_ty, at, arg.span)?;
         }
         *callee = mangled;
         Ok(sig.ret)
@@ -1299,6 +1445,7 @@ impl TypeCk {
             })
             .collect();
         let ret = subst_type(&g.ret, subst);
+        reject_ref_return(&ret, g.span)?;
         let mut body = g.body.clone();
         subst_expr(&mut body, subst);
 
@@ -1310,12 +1457,12 @@ impl TypeCk {
         self.fns.insert(mangled.clone(), sig);
         self.mono_cache.insert(key, mangled.clone());
 
-        let mut env: HashMap<String, Type> = HashMap::new();
+        let mut env: Env = HashMap::new();
         for p in &params {
-            env.insert(p.name.clone(), p.ty.clone());
+            env.insert(p.name.clone(), Local::new(p.ty.clone()));
         }
         let body_span = body.span;
-        let body_ty = self.check_expr(&mut body, &mut env)?;
+        let body_ty = self.check_expr(&mut body, &mut env, UseMode::Move)?;
         expect(&ret, &body_ty, body_span)?;
 
         self.mono_fns.push(Function {
@@ -1336,6 +1483,7 @@ fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             elem: Box::new(subst_type(elem, subst)),
             len: *len,
         },
+        Type::Ref(inner) => Type::Ref(Box::new(subst_type(inner, subst))),
         other => other.clone(),
     }
 }
@@ -1427,7 +1575,15 @@ fn unify_type_param(
                 span,
             }),
         },
-        _ => expect(pattern, concrete, span),
+        Type::Ref(pe) => match concrete {
+            Type::Ref(ce) => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        _ => expect_arg(pattern, concrete, span),
     }
 }
 
