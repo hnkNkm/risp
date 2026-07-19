@@ -1,0 +1,13 @@
+; Rc-backed dynamic strings.
+;;! stdout: hello, Risp!
+;;! stdout: 12
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [a: str "hello, "
+        b: str "Risp!"
+        c: str (str-concat a b)]
+    (do
+      (println c)
+      (println (str-len c))
+      0)))

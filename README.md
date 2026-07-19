@@ -39,15 +39,14 @@ ok: f64 cmp
 | `f32` | 32bit浮動小数点 |
 | `f64` | 64bit浮動小数点 |
 | `bool` | 真偽値 |
-| `str` | 静的文字列（コンパイル時定数のみ。動的Stringは将来対応） |
+| `str` | 動的文字列（参照カウント / `runtime/risp_rt.c`） |
 | `(Array T N)` | 固定長配列（要素は数値 / `bool`。ローカルのみ。代入は参照意味論） |
 
-### メモリ管理（MVP方針）
+### メモリ管理
 
-- MVPは**値型のみ**＋**静的文字列リテラル**で開始
-- 文字列は LLVM のグローバル定数として埋め込む
-- ヒープ動的データが必要になった時点で、Rc/Arc 方式 or Boehm GC 方式を判断
-- 借用チェッカ（Rust的所有権）はMVPでは導入しない
+- 数値・`bool`・固定長配列は値 / スタック
+- **`str` は参照カウント**（C ランタイム `risp_str_*`）。GC ではなく Rc 方針（将来の所有権検査へ寄せやすい）
+- 借用チェッカ（Rust的所有権）は未導入（Phase 5）
 
 ### 構文
 
@@ -130,6 +129,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
 | ループ | `(while cond body)`（値は Unit。`break` は未実装） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
+| 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
 
 ### 評価戦略
@@ -255,7 +255,7 @@ cargo run -- run examples/hello.rsp
 - [x] e2e テスト（`examples/` を実行して期待出力と比較）
 
 ### Phase 3 — 言語機能
-- [ ] 動的String（Rc or GC）
+- [x] 動的 String（Rc ランタイム）
 - [ ] struct / enum
 - [ ] パターンマッチ（match）
 - [x] while（`break` / `loop` は将来）
