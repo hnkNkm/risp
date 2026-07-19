@@ -1,0 +1,28 @@
+; loop + break, and break inside while.
+;;! stdout: ok: loop-break
+;;! exit: 0
+
+(defn sum-to [n: i32] -> i32
+  (let [i: i32 0, acc: i32 0]
+    (do
+      (loop
+        (if (>= i n)
+          (break)
+          (do
+            (set! acc (+ acc i))
+            (set! i (+ i 1)))))
+      acc)))
+
+(defn while-break [n: i32] -> i32
+  (let [i: i32 0]
+    (do
+      (while (< i n)
+        (if (= i 3)
+          (break)
+          (set! i (+ i 1))))
+      i)))
+
+(defn main [] -> i32
+  (if (and (= (sum-to 5) 10) (= (while-break 10) 3))
+    (do (println "ok: loop-break") 0)
+    (do (println "FAIL: loop-break") 1)))

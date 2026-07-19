@@ -76,6 +76,9 @@ ok: f64 cmp
     (set! acc (+ acc i))
     (set! i (+ i 1))))
 
+(loop
+  (if done (break) (set! i (+ i 1))))
+
 ;; 固定長配列
 (let [a: (Array i32 3) (array i32 1 2 3)]
   (do
@@ -141,7 +144,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 論理 | `and` `or` `not`（`and` / `or` は短絡評価） |
 | キャスト | `(as T e)`（数値型間） |
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
-| ループ | `(while cond body)`（値は Unit。`break` は未実装） |
+| ループ | `(while cond body)` / `(loop body)` / `(break)`（値は Unit） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |

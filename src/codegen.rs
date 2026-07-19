@@ -39,6 +39,8 @@ pub struct Codegen<'ctx> {
     current_fn: Option<String>,
     /// Loop header for self-tail-call optimization.
     loop_header: Option<BasicBlock<'ctx>>,
+    /// Exit blocks for nested `while` / `loop` (`break` targets).
+    loop_exits: Vec<BasicBlock<'ctx>>,
     str_count: usize,
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
@@ -61,11 +63,19 @@ impl<'ctx> Codegen<'ctx> {
             param_names: Vec::new(),
             current_fn: None,
             loop_header: None,
+            loop_exits: Vec::new(),
             str_count: 0,
             structs: HashMap::new(),
             enums: HashMap::new(),
             variants: HashMap::new(),
         }
+    }
+
+    fn block_terminated(&self) -> bool {
+        self.builder
+            .get_insert_block()
+            .and_then(|b| b.get_terminator())
+            .is_some()
     }
 
     /// Consume the codegen wrapper and return the LLVM module (e.g. for JIT).
@@ -569,24 +579,48 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(then_bb);
                 let tv = self.emit_expr(then_branch)?;
                 let then_end = self.builder.get_insert_block().unwrap();
-                self.builder.build_unconditional_branch(merge_bb).map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                let then_ok = !self.block_terminated();
+                if then_ok {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                }
 
                 self.builder.position_at_end(else_bb);
                 let ev = self.emit_expr(else_branch)?;
                 let else_end = self.builder.get_insert_block().unwrap();
-                self.builder.build_unconditional_branch(merge_bb).map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                let else_ok = !self.block_terminated();
+                if else_ok {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                }
 
                 self.builder.position_at_end(merge_bb);
+                if !then_ok && !else_ok {
+                    self.builder
+                        .build_unreachable()
+                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                    return Ok(None);
+                }
 
                 if ty == Type::Unit {
                     return Ok(None);
                 }
 
                 let bt = self.llvm_basic(&ty);
-                let phi = self.builder.build_phi(bt, "iftmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                let tv = tv.ok_or_else(|| CodegenError::Internal("if then no value".into()))?;
-                let ev = ev.ok_or_else(|| CodegenError::Internal("if else no value".into()))?;
-                phi.add_incoming(&[(&tv, then_end), (&ev, else_end)]);
+                let phi = self
+                    .builder
+                    .build_phi(bt, "iftmp")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                if then_ok {
+                    let tv = tv.ok_or_else(|| CodegenError::Internal("if then no value".into()))?;
+                    phi.add_incoming(&[(&tv, then_end)]);
+                }
+                if else_ok {
+                    let ev = ev.ok_or_else(|| CodegenError::Internal("if else no value".into()))?;
+                    phi.add_incoming(&[(&ev, else_end)]);
+                }
                 Ok(Some(phi.as_basic_value()))
             }
             ExprKind::Let { bindings, body } => {
@@ -597,8 +631,10 @@ impl<'ctx> Codegen<'ctx> {
                     prev.push(self.bind_local(fv, b)?);
                 }
                 let result = self.emit_expr(body)?;
-                // Drop this scope's str bindings, then restore outer locals.
-                self.release_let_str_bindings(bindings)?;
+                // Drop this scope's str bindings when the body did not exit via break.
+                if !self.block_terminated() {
+                    self.release_let_str_bindings(bindings)?;
+                }
                 for (name, p) in prev.into_iter().rev() {
                     match p {
                         Some(x) => {
@@ -618,6 +654,9 @@ impl<'ctx> Codegen<'ctx> {
                 let last_i = exprs.len() - 1;
                 let mut last: Option<BasicValueEnum<'ctx>> = None;
                 for (i, ex) in exprs.iter().enumerate() {
+                    if self.block_terminated() {
+                        break;
+                    }
                     let v = self.emit_expr(ex)?;
                     if i != last_i {
                         if ex.ty.as_ref() == Some(&Type::Str) {
@@ -662,6 +701,20 @@ impl<'ctx> Codegen<'ctx> {
             }
             ExprKind::While { cond, body } => {
                 self.emit_while(cond, body)?;
+                Ok(None)
+            }
+            ExprKind::Loop { body } => {
+                self.emit_loop(body)?;
+                Ok(None)
+            }
+            ExprKind::Break => {
+                let exit = *self
+                    .loop_exits
+                    .last()
+                    .ok_or_else(|| CodegenError::Internal("break without loop".into()))?;
+                self.builder
+                    .build_unconditional_branch(exit)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 Ok(None)
             }
             ExprKind::ArrayLit { elem_ty, elems } => {
@@ -876,9 +929,12 @@ impl<'ctx> Codegen<'ctx> {
 
             let body_v = self.emit_expr(&arm.body)?;
             let end_bb = self.builder.get_insert_block().unwrap();
-            self.builder
-                .build_unconditional_branch(merge_bb)
-                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            let reached_merge = !self.block_terminated();
+            if reached_merge {
+                self.builder
+                    .build_unconditional_branch(merge_bb)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            }
 
             if let Some(bname) = &arm.binding {
                 match prev {
@@ -891,7 +947,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
 
-            if *result_ty != Type::Unit {
+            if reached_merge && *result_ty != Type::Unit {
                 let v = body_v.ok_or_else(|| CodegenError::Internal("match arm value".into()))?;
                 incoming.push((v, end_bb));
             }
@@ -1100,11 +1156,43 @@ impl<'ctx> Codegen<'ctx> {
             .build_conditional_branch(cv, body_bb, end_bb)
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
+        self.loop_exits.push(end_bb);
         self.builder.position_at_end(body_bb);
         let _ = self.emit_expr(body)?;
+        if !self.block_terminated() {
+            self.builder
+                .build_unconditional_branch(cond_bb)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+        self.loop_exits.pop();
+
+        self.builder.position_at_end(end_bb);
+        Ok(())
+    }
+
+    fn emit_loop(&mut self, body: &Expr) -> Result<(), CodegenError> {
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let body_bb = self.context.append_basic_block(fv, "loop.body");
+        let end_bb = self.context.append_basic_block(fv, "loop.end");
+
         self.builder
-            .build_unconditional_branch(cond_bb)
+            .build_unconditional_branch(body_bb)
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.loop_exits.push(end_bb);
+        self.builder.position_at_end(body_bb);
+        let _ = self.emit_expr(body)?;
+        if !self.block_terminated() {
+            self.builder
+                .build_unconditional_branch(body_bb)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+        self.loop_exits.pop();
 
         self.builder.position_at_end(end_bb);
         Ok(())

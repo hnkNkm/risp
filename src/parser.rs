@@ -523,6 +523,22 @@ impl<'a> Parser<'a> {
                     Span::new(start, rp.span.end),
                 ))
             }
+            Some("loop") => {
+                self.bump();
+                let body = self.parse_expr()?;
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Loop {
+                        body: Box::new(body),
+                    },
+                    Span::new(start, rp.span.end),
+                ))
+            }
+            Some("break") => {
+                self.bump();
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(ExprKind::Break, Span::new(start, rp.span.end)))
+            }
             Some("array") => {
                 self.bump();
                 let elem_ty = self.parse_type()?;

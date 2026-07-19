@@ -1,0 +1,8 @@
+; break must appear inside while/loop.
+;;! error_at: 7:5
+;;! error_contains: `break` outside of loop
+
+(defn main [] -> i32
+  (do
+    (break)
+    0))
