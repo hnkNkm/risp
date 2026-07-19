@@ -1,0 +1,23 @@
+---
+description: Cursor 設定の global / local 分担（このリポ向けメモ）
+alwaysApply: false
+---
+
+# 設定の分担
+
+## Global（`~/.cursor/cli-config.json` / Cursor Settings）
+
+- Attribution（Made with Cursor）OFF
+- モデル・privacy・sandbox・approvalMode
+- 全リポ共通の User Rules（日本語応答、一般的な git 安全ルールなど）
+
+## Local（このリポの `.cursor/rules/`）
+
+- Risp のビルド・テスト手順
+- コミット / PR フォーマット
+- ランタイム（Rc str）や examples の e2e 慣習
+
+## 置かないもの
+
+- モデル ID や個人の attribution 設定をリポに書かない
+- 空の `.cursor/cli.json` は不要（グローバルで足りる）

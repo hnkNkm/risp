@@ -1,0 +1,39 @@
+---
+description: Risp プロジェクト固有の開発・Git 規約
+alwaysApply: true
+---
+
+# Risp プロジェクト規約
+
+## 言語・ビルド
+
+- 言語: Risp（`.rsp`）。コンパイラは Rust + LLVM（inkwell / LLVM 18）
+- パイプライン: Lexer → Parser → TypeCk → Codegen → object → `cc` リンク
+- `str` は Rc（`runtime/risp_rt.c`）。AOT 時はランタイムをリンクする
+- 確認コマンド:
+  - `cargo test`
+  - `cargo risp run examples/<name>.rsp`
+  - `cargo risp repl`（JIT）
+
+## コミットメッセージ
+
+形式: `<type>: <概要> - <詳細>`
+
+- type: `feat` / `fix` / `refactor` / `chore` / `docs` / `build`
+- 概要は60文字以内・日本語
+- ユーザーが明示的に依頼したときだけ commit する
+
+## プルリクエスト本文
+
+次の見出しを使う（日本語）:
+
+### 概要
+### 変更内容
+### 動作確認
+### 備考
+
+## 実装方針
+
+- 既存の手書きパーサ / AST / typeck / codegen のスタイルに合わせる
+- 大きな機能は Issue 単位で小さく PR にする
+- e2e は `examples/*.rsp` と `examples/errors/*.rsp` の `;;!` ヘッダで検証する
