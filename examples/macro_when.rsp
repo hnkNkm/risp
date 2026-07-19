@@ -1,0 +1,11 @@
+; Syntactic macro (`when`) expands before type checking.
+;;! stdout: ok: macro
+;;! exit: 0
+
+(defmacro when [cond body]
+  (if cond body (do)))
+
+(defn main [] -> i32
+  (do
+    (when true (println "ok: macro"))
+    0))

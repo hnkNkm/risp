@@ -2,6 +2,7 @@
 
 use crate::codegen::Codegen;
 use crate::diagnostic::{Loc, render};
+use crate::macroexpand;
 use crate::parser::{self, FrontendError};
 use crate::typeck::{self, TypeCk};
 use inkwell::OptimizationLevel;
@@ -94,7 +95,7 @@ fn print_help() {
          ;   :quit / :q     exit\n\
          ;   :clear         drop accumulated definitions\n\
          ;   :defs          show accumulated definitions\n\
-         ; Definitions (`defn` / `def` / `struct` / `enum` / `extern` / `trait` / `impl`) persist across inputs.\n\
+         ; Definitions (`defn` / `def` / `defmacro` / `struct` / `enum` / `extern` / `trait` / `impl`) persist across inputs.\n\
          ; Other expressions are JIT-evaluated and printed."
     );
 }
@@ -126,6 +127,7 @@ impl Session {
         trial.push(input.to_string());
         let src = trial.join("\n");
         let mut prog = parser::parse(&src).map_err(|e| render_frontend("<repl>", &src, &e))?;
+        macroexpand::expand(&mut prog).map_err(|e| render_macro("<repl>", &src, &e))?;
         let mut tyck = TypeCk::new();
         tyck.check_ex(&mut prog, false)
             .map_err(|e| render_typeck("<repl>", &src, &e))?;
@@ -143,6 +145,7 @@ impl Session {
         ));
         let src = parts.join("\n");
         let mut prog = parser::parse(&src).map_err(|e| render_frontend("<repl>", &src, &e))?;
+        macroexpand::expand(&mut prog).map_err(|e| render_macro("<repl>", &src, &e))?;
         let mut tyck = TypeCk::new();
         tyck.check_ex(&mut prog, false)
             .map_err(|e| render_typeck("<repl>", &src, &e))?;
@@ -174,6 +177,7 @@ fn jit_call(prog: &crate::ast::Program, tyck: &TypeCk, fn_name: &str) -> Result<
 fn is_definition(src: &str) -> bool {
     let t = src.trim_start();
     t.starts_with("(defn")
+        || t.starts_with("(defmacro")
         || t.starts_with("(def ")
         || t.starts_with("(def\t")
         || t.starts_with("(def\n")
@@ -227,6 +231,13 @@ fn render_frontend(file: &str, src: &str, e: &FrontendError) -> String {
 }
 
 fn render_typeck(file: &str, src: &str, e: &typeck::TypeError) -> String {
+    match e.span() {
+        Some(s) => render(file, src, Loc::from_span(s), &e.to_string()),
+        None => format!("error: {e}\n  --> {file}\n"),
+    }
+}
+
+fn render_macro(file: &str, src: &str, e: &macroexpand::MacroError) -> String {
     match e.span() {
         Some(s) => render(file, src, Loc::from_span(s), &e.to_string()),
         None => format!("error: {e}\n  --> {file}\n"),

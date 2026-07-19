@@ -410,7 +410,7 @@ impl TypeCk {
                     self.consts.insert(c.name.clone(), c.ty.clone());
                 }
                 TopLevel::Struct(_) | TopLevel::Enum(_) | TopLevel::Trait(_) => {}
-                TopLevel::Impl(_) => {}
+                TopLevel::Impl(_) | TopLevel::DefMacro(_) => {}
             }
         }
 
@@ -557,7 +557,8 @@ impl TypeCk {
                 | TopLevel::Enum(_)
                 | TopLevel::Extern(_)
                 | TopLevel::Trait(_)
-                | TopLevel::GenericFunction(_) => {}
+                | TopLevel::GenericFunction(_)
+                | TopLevel::DefMacro(_) => {}
             }
         }
 

@@ -2,6 +2,7 @@ mod ast;
 mod codegen;
 mod diagnostic;
 mod lexer;
+mod macroexpand;
 mod parser;
 mod repl;
 mod typeck;
@@ -65,6 +66,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::EmitLlvm { input } => {
             let (src, file) = load(&input)?;
             let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
+            macroexpand::expand(&mut prog).map_err(|e| render_macro(&file, &src, &e))?;
             let mut tyck = typeck::TypeCk::new();
             tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;
             let context = Context::create();
@@ -125,9 +127,17 @@ fn render_typeck(file: &str, src: &str, e: &typeck::TypeError) -> String {
     }
 }
 
+fn render_macro(file: &str, src: &str, e: &macroexpand::MacroError) -> String {
+    match e.span() {
+        Some(s) => render(file, src, Loc::from_span(s), &e.to_string()),
+        None => format!("error: {e}\n  --> {file}\n"),
+    }
+}
+
 fn build(input: &Path, output: Option<&Path>) -> Result<PathBuf, String> {
     let (src, file) = load(input)?;
     let mut prog = parser::parse(&src).map_err(|e| render_frontend(&file, &src, &e))?;
+    macroexpand::expand(&mut prog).map_err(|e| render_macro(&file, &src, &e))?;
     let mut tyck = typeck::TypeCk::new();
     tyck.check(&mut prog).map_err(|e| render_typeck(&file, &src, &e))?;
 

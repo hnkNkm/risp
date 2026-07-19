@@ -113,11 +113,62 @@ impl<'a> Parser<'a> {
                 let i = self.parse_impl_body(start)?;
                 Ok(TopLevel::Impl(i))
             }
+            "defmacro" => {
+                let m = self.parse_defmacro_body(start)?;
+                Ok(TopLevel::DefMacro(m))
+            }
             other => Err(ParseError::Unexpected(
                 format!("top-level form {:?}", other),
                 head.span.start,
             )),
         }
+    }
+
+    /// `defmacro name [a b c] template)` — LParen + "defmacro" already consumed.
+    /// Params are bare idents (no type annotations).
+    fn parse_defmacro_body(&mut self, start: usize) -> Result<MacroDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+
+        self.eat(&Token::LBracket)?;
+        let mut params = Vec::new();
+        loop {
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::RBracket)) {
+                break;
+            }
+            let p_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+            let pname = match &p_tok.tok {
+                Token::Ident(s) => s.clone(),
+                other => {
+                    return Err(ParseError::Unexpected(
+                        format!("{:?}", other),
+                        p_tok.span.start,
+                    ));
+                }
+            };
+            params.push(pname);
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
+                self.bump();
+            }
+        }
+        self.eat(&Token::RBracket)?;
+
+        let template = self.parse_expr()?;
+        let rp = self.eat(&Token::RParen)?;
+        Ok(MacroDef {
+            name,
+            params,
+            template,
+            span: Span::new(start, rp.span.end),
+        })
     }
 
     /// `trait Name (method [params] -> ret)* )` — LParen + "trait" already consumed

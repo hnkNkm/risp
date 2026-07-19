@@ -1,0 +1,9 @@
+; Macro call with wrong arity.
+;;! error_at: 9:3
+;;! error_contains: macro arity mismatch
+
+(defmacro when [cond body]
+  (if cond body (do)))
+
+(defn main [] -> i32
+  (when true))
