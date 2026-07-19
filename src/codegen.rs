@@ -62,6 +62,11 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Consume the codegen wrapper and return the LLVM module (e.g. for JIT).
+    pub fn into_module(self) -> Module<'ctx> {
+        self.module
+    }
+
     pub fn compile_program(&mut self, prog: &Program, _tyck: &TypeCk) -> Result<(), CodegenError> {
         // declare external `puts(i8*) -> i32` for println
         let i32_ty = self.context.i32_type();

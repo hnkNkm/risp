@@ -3,6 +3,7 @@ mod codegen;
 mod diagnostic;
 mod lexer;
 mod parser;
+mod repl;
 mod typeck;
 
 use clap::{Parser as ClapParser, Subcommand};
@@ -40,6 +41,8 @@ enum Cmd {
     EmitLlvm { input: PathBuf },
     /// Print parsed AST to stdout
     EmitAst { input: PathBuf },
+    /// Interactive REPL (LLVM JIT)
+    Repl,
 }
 
 fn main() {
@@ -86,6 +89,9 @@ fn run(cli: Cli) -> Result<(), String> {
             };
             let status = Command::new(&exec).status().map_err(plain)?;
             std::process::exit(status.code().unwrap_or(1));
+        }
+        Cmd::Repl => {
+            repl::run()?;
         }
     }
     Ok(())

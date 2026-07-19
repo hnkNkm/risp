@@ -378,6 +378,17 @@ pub fn parse(src: &str) -> Result<Program, FrontendError> {
     Ok(p.parse_program()?)
 }
 
+/// Parse a single expression (for REPL evaluation).
+pub fn parse_expr_src(src: &str) -> Result<Expr, FrontendError> {
+    let toks = crate::lexer::lex(src)?;
+    let mut p = Parser::new(&toks);
+    let expr = p.parse_expr()?;
+    if let Some(extra) = p.peek() {
+        return Err(ParseError::Unexpected(format!("{:?}", extra.tok), extra.span.start).into());
+    }
+    Ok(expr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
