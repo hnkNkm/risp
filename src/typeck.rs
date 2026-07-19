@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // some variants are placeholders for future checks
 pub enum TypeError {
     #[error("undefined variable {0:?}")]
     UndefinedVar(String, Span),
@@ -21,6 +20,10 @@ pub enum TypeError {
     IntLitOverflow(Type, Span),
     #[error("cannot cast from {from} to {to}")]
     BadCast { from: Type, to: Type, span: Span },
+    #[error("duplicate definition of {0:?}")]
+    Duplicate(String, Span),
+    #[error("const initializer must be a literal")]
+    ConstNotLiteral(Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -35,7 +38,9 @@ impl TypeError {
             | TypeError::Arity { span: s, .. }
             | TypeError::BadOperand { span: s, .. }
             | TypeError::IntLitOverflow(_, s)
-            | TypeError::BadCast { span: s, .. } => Some(*s),
+            | TypeError::BadCast { span: s, .. }
+            | TypeError::Duplicate(_, s)
+            | TypeError::ConstNotLiteral(s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -62,6 +67,9 @@ impl TypeCk {
         for it in &prog.items {
             match it {
                 TopLevel::Function(f) => {
+                    if self.fns.contains_key(&f.name) || self.consts.contains_key(&f.name) {
+                        return Err(TypeError::Duplicate(f.name.clone(), f.span));
+                    }
                     let sig = FnSig {
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: f.ret.clone(),
@@ -69,6 +77,9 @@ impl TypeCk {
                     self.fns.insert(f.name.clone(), sig);
                 }
                 TopLevel::Const(c) => {
+                    if self.fns.contains_key(&c.name) || self.consts.contains_key(&c.name) {
+                        return Err(TypeError::Duplicate(c.name.clone(), c.span));
+                    }
                     self.consts.insert(c.name.clone(), c.ty.clone());
                 }
             }
@@ -108,6 +119,9 @@ impl TypeCk {
                     expect(&f.ret, &body_ty, body_span)?;
                 }
                 TopLevel::Const(c) => {
+                    if !matches!(c.value.kind, ExprKind::Lit(_)) {
+                        return Err(TypeError::ConstNotLiteral(c.value.span));
+                    }
                     let mut env = HashMap::new();
                     let val_span = c.value.span;
                     let ty = self.check_expr(&mut c.value, &mut env)?;
@@ -121,7 +135,15 @@ impl TypeCk {
     fn check_expr(&self, e: &mut Expr, env: &mut HashMap<String, Type>) -> Result<Type, TypeError> {
         let span = e.span;
         let ty = match &mut e.kind {
-            ExprKind::Lit(l) => lit_type(l),
+            ExprKind::Lit(l) => {
+                let ty = lit_type(l);
+                if let Lit::Int(v, _) = l {
+                    if ty == Type::I32 && (*v < i32::MIN as i64 || *v > i32::MAX as i64) {
+                        return Err(TypeError::IntLitOverflow(Type::I32, span));
+                    }
+                }
+                ty
+            }
             ExprKind::Var(name) => {
                 if let Some(t) = env.get(name) {
                     t.clone()

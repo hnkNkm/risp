@@ -1,0 +1,7 @@
+; Unsuffixed int literal defaults to i32 and must fit.
+;;! error_at: 6:16
+;;! error_contains: integer literal does not fit
+
+(defn main [] -> i32
+  (let [x: i32 3000000000]
+    0))
