@@ -1,0 +1,14 @@
+; and/or must short-circuit — skipped branches must not print.
+;;! stdout: ok: short-circuit
+;;! exit: 0
+
+(defn main [] -> i32
+  (do
+    ;; false and <side-effect> → rhs skipped
+    (and false (do (println "FAIL: and evaluated rhs") true))
+    ;; true or <side-effect> → rhs skipped
+    (or true (do (println "FAIL: or evaluated rhs") false))
+    ;; both sides run when needed; result still correct
+    (if (and true (or false true))
+      (do (println "ok: short-circuit") 0)
+      (do (println "FAIL: value") 1))))
