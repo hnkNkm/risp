@@ -1,0 +1,11 @@
+; Call a trait method with no matching impl.
+;;! error_at: 10:14
+;;! error_contains: missing impl
+
+(trait Show
+  (show [self] -> str))
+
+(defn main [] -> i32
+  (do
+    (println (show 1))
+    0))

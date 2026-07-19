@@ -11,7 +11,7 @@ Rustの型システムを持つLispライクなプログラミング言語。LLV
 - S式構文を採用したLisp系言語
 - Rust由来の静的型システム（i32 / i64 / f32 / f64 / bool / str など）
 - LLVMバックエンドによるネイティブコード生成
-- 将来的にマクロ・struct・enum・trait/implを導入
+- 将来的にマクロ・ジェネリクスを導入（struct / enum / trait/impl は MVP 済み）
 
 ## 現状（Phase 1: MVP 完了）
 
@@ -98,6 +98,14 @@ ok: f64 cmp
   (None 0)
   (Some n n))
 
+;; trait / impl（静的ディスパッチ。メソッド名は trait 間でグローバルに一意）
+(trait Show
+  (show [self] -> str))
+(impl Show for i32
+  (show [self] -> str
+    "i32"))
+(println (show 1))
+
 ;; 条件分岐
 (if (< x 0) (- x) x)
 
@@ -147,6 +155,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | ループ | `(while cond body)` / `(loop body)` / `(break)`（値は Unit） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
+| trait | `(trait Name (method [self ...] -> T)*)` / `(impl Name for T ...)`（静的ディスパッチ。先頭引数は bare `self` 可） |
 | FFI | `(extern "C" name [params] -> ret)`（プリミティブ / `str`。`str` は C 文字列に変換） |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
@@ -200,7 +209,7 @@ risp> (add 1 2)
 risp> :quit
 ```
 
-- `defn` / `def` はセッションに蓄積される（`:clear` で破棄、`:defs` で一覧）
+- `defn` / `def` / `struct` / `enum` / `extern` / `trait` / `impl` はセッションに蓄積される（`:clear` で破棄、`:defs` で一覧）
 - それ以外の式は JIT 評価して `println` する
 - 括弧が閉じるまで複数行入力可
 
@@ -280,7 +289,7 @@ cargo run -- run examples/hello.rsp
 - [x] while / loop / break
 
 ### Phase 4 — 抽象化
-- [ ] trait / impl
+- [x] trait / impl（静的ディスパッチ MVP。メソッド名は trait 間で一意）
 - [ ] ジェネリクス（モノモーフィゼーション）
 - [ ] マクロ（defmacro）
 - [x] REPL（inkwell::execution_engine でJIT）

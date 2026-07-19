@@ -1,0 +1,15 @@
+; Static trait/impl dispatch for Show on i32.
+;;! stdout: ok: trait
+;;! exit: 0
+
+(trait Show
+  (show [self] -> str))
+
+(impl Show for i32
+  (show [self] -> str
+    "ok: trait"))
+
+(defn main [] -> i32
+  (do
+    (println (show 42))
+    0))

@@ -67,6 +67,26 @@ pub enum TypeError {
     BadExternAbi(String, Span),
     #[error("extern parameter/return type {0} is not supported")]
     BadExternType(Type, Span),
+    #[error("missing impl of trait {trait_name} for {ty}")]
+    MissingImpl {
+        trait_name: String,
+        ty: Type,
+        span: Span,
+    },
+    #[error("duplicate impl of trait {trait_name} for {ty}")]
+    DuplicateImpl {
+        trait_name: String,
+        ty: Type,
+        span: Span,
+    },
+    #[error("method {0:?} is not a member of trait {1}")]
+    MethodNotInTrait(String, String, Span),
+    #[error("ambiguous trait method name {0:?} (method names must be unique across traits)")]
+    AmbiguousTraitMethod(String, Span),
+    #[error("undefined trait {0:?}")]
+    UndefinedTrait(String, Span),
+    #[error("trait method call requires at least one argument (receiver)")]
+    TraitCallNoReceiver(Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -102,10 +122,27 @@ impl TypeError {
             | TypeError::EmptyEnum(_, s)
             | TypeError::BreakOutsideLoop(s)
             | TypeError::BadExternAbi(_, s)
-            | TypeError::BadExternType(_, s) => Some(*s),
+            | TypeError::BadExternType(_, s)
+            | TypeError::MissingImpl { span: s, .. }
+            | TypeError::DuplicateImpl { span: s, .. }
+            | TypeError::MethodNotInTrait(_, _, s)
+            | TypeError::AmbiguousTraitMethod(_, s)
+            | TypeError::UndefinedTrait(_, s)
+            | TypeError::TraitCallNoReceiver(s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
+}
+
+/// Mangle an impl method to a unique LLVM / fn-table name.
+/// Type display is sanitized: non-alphanumeric chars become `_`.
+pub fn mangle_method(trait_name: &str, ty: &Type, method: &str) -> String {
+    let ty_s: String = ty
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("__risp_{trait_name}_{ty_s}_{method}")
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +167,12 @@ pub struct TypeCk {
     pub variants: HashMap<String, VariantInfo>,
     /// Names declared via `(extern "C" …)`.
     pub externs: HashMap<String, FnSig>,
+    /// Trait name -> definition
+    pub traits: HashMap<String, TraitDef>,
+    /// Trait method name -> owning trait name (globally unique in MVP)
+    pub trait_methods: HashMap<String, String>,
+    /// (trait_name, for_ty) that have an impl
+    pub impls: HashSet<(String, Type)>,
     /// Nesting depth of `while` / `loop` while checking expressions.
     loop_depth: usize,
 }
@@ -143,6 +186,9 @@ impl TypeCk {
             enums: HashMap::new(),
             variants: HashMap::new(),
             externs: HashMap::new(),
+            traits: HashMap::new(),
+            trait_methods: HashMap::new(),
+            impls: HashSet::new(),
             loop_depth: 0,
         }
     }
@@ -167,6 +213,9 @@ impl TypeCk {
         self.enums.clear();
         self.variants.clear();
         self.externs.clear();
+        self.traits.clear();
+        self.trait_methods.clear();
+        self.impls.clear();
 
         // Collect type definitions first.
         for it in &prog.items {
@@ -215,6 +264,47 @@ impl TypeCk {
                     self.enums.insert(e.name.clone(), e.clone());
                 }
                 _ => {}
+            }
+        }
+
+        // Collect traits (method names must be globally unique across traits).
+        for it in &prog.items {
+            if let TopLevel::Trait(t) = it {
+                self.register_name(&t.name, t.span)?;
+                let mut seen_methods = HashSet::new();
+                for m in &t.methods {
+                    if !seen_methods.insert(m.name.clone()) {
+                        return Err(TypeError::Duplicate(m.name.clone(), m.span));
+                    }
+                    if self.trait_methods.contains_key(&m.name) {
+                        return Err(TypeError::AmbiguousTraitMethod(m.name.clone(), m.span));
+                    }
+                    self.register_name(&m.name, m.span)?;
+                    if m.params.is_empty() {
+                        return Err(TypeError::Arity {
+                            name: m.name.clone(),
+                            expected: 1,
+                            got: 0,
+                            span: m.span,
+                        });
+                    }
+                    for (i, p) in m.params.iter().enumerate() {
+                        if i == 0 && p.name == "self" {
+                            // Bare / receiver self — concrete type comes from impl.
+                            continue;
+                        }
+                        self.resolve_type(&p.ty, p.span)?;
+                        if matches!(p.ty, Type::Array { .. }) {
+                            return Err(TypeError::ArrayInSignature(p.span));
+                        }
+                    }
+                    self.resolve_type(&m.ret, m.span)?;
+                    if matches!(m.ret, Type::Array { .. }) {
+                        return Err(TypeError::ArrayInSignature(m.span));
+                    }
+                    self.trait_methods.insert(m.name.clone(), t.name.clone());
+                }
+                self.traits.insert(t.name.clone(), t.clone());
             }
         }
 
@@ -270,7 +360,94 @@ impl TypeCk {
                     self.resolve_type(&c.ty, c.span)?;
                     self.consts.insert(c.name.clone(), c.ty.clone());
                 }
-                TopLevel::Struct(_) | TopLevel::Enum(_) => {}
+                TopLevel::Struct(_) | TopLevel::Enum(_) | TopLevel::Trait(_) => {}
+                TopLevel::Impl(_) => {}
+            }
+        }
+
+        // Collect impls: match trait sigs, fill self type, register mangled fns.
+        for it in &mut prog.items {
+            if let TopLevel::Impl(ib) = it {
+                let trait_def = self
+                    .traits
+                    .get(&ib.trait_name)
+                    .cloned()
+                    .ok_or_else(|| TypeError::UndefinedTrait(ib.trait_name.clone(), ib.span))?;
+                self.resolve_type(&ib.for_ty, ib.span)?;
+                let key = (ib.trait_name.clone(), ib.for_ty.clone());
+                if !self.impls.insert(key) {
+                    return Err(TypeError::DuplicateImpl {
+                        trait_name: ib.trait_name.clone(),
+                        ty: ib.for_ty.clone(),
+                        span: ib.span,
+                    });
+                }
+
+                let mut impl_methods: HashSet<String> = HashSet::new();
+                for m in &mut ib.methods {
+                    if !impl_methods.insert(m.name.clone()) {
+                        return Err(TypeError::Duplicate(m.name.clone(), m.span));
+                    }
+                    let Some(tsig) = trait_def.methods.iter().find(|t| t.name == m.name) else {
+                        return Err(TypeError::MethodNotInTrait(
+                            m.name.clone(),
+                            ib.trait_name.clone(),
+                            m.span,
+                        ));
+                    };
+                    if m.params.len() != tsig.params.len() {
+                        return Err(TypeError::Arity {
+                            name: m.name.clone(),
+                            expected: tsig.params.len(),
+                            got: m.params.len(),
+                            span: m.span,
+                        });
+                    }
+                    if m.ret != tsig.ret {
+                        return Err(TypeError::Mismatch {
+                            expected: tsig.ret.clone(),
+                            found: m.ret.clone(),
+                            span: m.span,
+                        });
+                    }
+                    // Fill self / first param type from `for T`.
+                    if let Some(first) = m.params.first_mut() {
+                        if first.name == "self" {
+                            first.ty = ib.for_ty.clone();
+                        }
+                    }
+                    for (i, p) in m.params.iter().enumerate() {
+                        if i == 0 && p.name == "self" {
+                            continue;
+                        }
+                        // Non-self params must match trait (after trait self is abstract).
+                        let tp = &tsig.params[i];
+                        if i > 0 || tp.name != "self" {
+                            if p.ty != tp.ty {
+                                return Err(TypeError::Mismatch {
+                                    expected: tp.ty.clone(),
+                                    found: p.ty.clone(),
+                                    span: p.span,
+                                });
+                            }
+                        }
+                        self.resolve_type(&p.ty, p.span)?;
+                        if matches!(p.ty, Type::Array { .. }) {
+                            return Err(TypeError::ArrayInSignature(p.span));
+                        }
+                    }
+                    self.resolve_type(&m.ret, m.span)?;
+                    if matches!(m.ret, Type::Array { .. }) {
+                        return Err(TypeError::ArrayInSignature(m.span));
+                    }
+
+                    let mangled = mangle_method(&ib.trait_name, &ib.for_ty, &m.name);
+                    let sig = FnSig {
+                        params: m.params.iter().map(|p| p.ty.clone()).collect(),
+                        ret: m.ret.clone(),
+                    };
+                    self.fns.insert(mangled, sig);
+                }
             }
         }
 
@@ -307,6 +484,17 @@ impl TypeCk {
                     let body_ty = self.check_expr(&mut f.body, &mut env)?;
                     expect(&f.ret, &body_ty, body_span)?;
                 }
+                TopLevel::Impl(ib) => {
+                    for m in &mut ib.methods {
+                        let mut env: HashMap<String, Type> = HashMap::new();
+                        for p in &m.params {
+                            env.insert(p.name.clone(), p.ty.clone());
+                        }
+                        let body_span = m.body.span;
+                        let body_ty = self.check_expr(&mut m.body, &mut env)?;
+                        expect(&m.ret, &body_ty, body_span)?;
+                    }
+                }
                 TopLevel::Const(c) => {
                     if !matches!(c.value.kind, ExprKind::Lit(_)) {
                         return Err(TypeError::ConstNotLiteral(c.value.span));
@@ -316,7 +504,10 @@ impl TypeCk {
                     let ty = self.check_expr(&mut c.value, &mut env)?;
                     expect(&c.ty, &ty, val_span)?;
                 }
-                TopLevel::Struct(_) | TopLevel::Enum(_) | TopLevel::Extern(_) => {}
+                TopLevel::Struct(_)
+                | TopLevel::Enum(_)
+                | TopLevel::Extern(_)
+                | TopLevel::Trait(_) => {}
             }
         }
         Ok(())
@@ -329,6 +520,8 @@ impl TypeCk {
             || self.enums.contains_key(name)
             || self.variants.contains_key(name)
             || self.externs.contains_key(name)
+            || self.traits.contains_key(name)
+            || self.trait_methods.contains_key(name)
         {
             return Err(TypeError::Duplicate(name.to_string(), span));
         }
@@ -498,10 +691,7 @@ impl TypeCk {
                 f.ty.clone()
             }
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, env, span)?,
-            ExprKind::Call { callee, args } => {
-                let callee = callee.clone();
-                self.check_call(&callee, args, env, span)?
-            }
+            ExprKind::Call { callee, args } => self.check_call(callee, args, env, span)?,
         };
         e.ty = Some(ty.clone());
         Ok(ty)
@@ -612,17 +802,55 @@ impl TypeCk {
 
     fn check_call(
         &mut self,
-        callee: &str,
+        callee: &mut String,
         args: &mut [Expr],
         env: &mut HashMap<String, Type>,
         call_span: Span,
     ) -> Result<Type, TypeError> {
+        // Trait method: resolve impl by first arg type and rewrite callee to mangled name.
+        if let Some(trait_name) = self.trait_methods.get(callee).cloned() {
+            if args.is_empty() {
+                return Err(TypeError::TraitCallNoReceiver(call_span));
+            }
+            let recv_ty = self.check_expr(&mut args[0], env)?;
+            if !self.impls.contains(&(trait_name.clone(), recv_ty.clone())) {
+                return Err(TypeError::MissingImpl {
+                    trait_name,
+                    ty: recv_ty,
+                    span: call_span,
+                });
+            }
+            let mangled = mangle_method(&trait_name, &recv_ty, callee);
+            let sig = self
+                .fns
+                .get(&mangled)
+                .cloned()
+                .ok_or_else(|| TypeError::UndefinedFn(mangled.clone(), call_span))?;
+            if sig.params.len() != args.len() {
+                return Err(TypeError::Arity {
+                    name: callee.clone(),
+                    expected: sig.params.len(),
+                    got: args.len(),
+                    span: call_span,
+                });
+            }
+            // Receiver already checked; remaining args against mangled sig.
+            expect(&sig.params[0], &recv_ty, args[0].span)?;
+            for (param_ty, arg) in sig.params.iter().skip(1).zip(args.iter_mut().skip(1)) {
+                let s = arg.span;
+                let at = self.check_expr(arg, env)?;
+                expect(param_ty, &at, s)?;
+            }
+            *callee = mangled;
+            return Ok(sig.ret.clone());
+        }
+
         // Struct constructor
-        if self.structs.contains_key(callee) {
-            let sdef = self.structs[callee].clone();
+        if self.structs.contains_key(callee.as_str()) {
+            let sdef = self.structs[callee.as_str()].clone();
             if sdef.fields.len() != args.len() {
                 return Err(TypeError::Arity {
-                    name: callee.into(),
+                    name: callee.clone(),
                     expected: sdef.fields.len(),
                     got: args.len(),
                     span: call_span,
@@ -637,13 +865,13 @@ impl TypeCk {
         }
 
         // Enum variant constructor
-        if self.variants.contains_key(callee) {
-            let info = self.variants[callee].clone();
+        if self.variants.contains_key(callee.as_str()) {
+            let info = self.variants[callee.as_str()].clone();
             match &info.payload {
                 None => {
                     if !args.is_empty() {
                         return Err(TypeError::Arity {
-                            name: callee.into(),
+                            name: callee.clone(),
                             expected: 0,
                             got: args.len(),
                             span: call_span,
@@ -653,7 +881,7 @@ impl TypeCk {
                 Some(pty) => {
                     if args.len() != 1 {
                         return Err(TypeError::Arity {
-                            name: callee.into(),
+                            name: callee.clone(),
                             expected: 1,
                             got: args.len(),
                             span: call_span,
@@ -668,11 +896,11 @@ impl TypeCk {
         }
 
         // builtins first
-        match callee {
+        match callee.as_str() {
             "/" | "mod" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 2,
                         got: args.len(),
                         span: call_span,
@@ -683,7 +911,7 @@ impl TypeCk {
             "+" | "*" => {
                 if args.is_empty() {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: 0,
                         span: call_span,
@@ -694,7 +922,7 @@ impl TypeCk {
             "-" => {
                 if args.is_empty() {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: 0,
                         span: call_span,
@@ -705,7 +933,7 @@ impl TypeCk {
             "<" | "<=" | ">" | ">=" | "=" | "!=" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 2,
                         got: args.len(),
                         span: call_span,
@@ -724,7 +952,7 @@ impl TypeCk {
                 }
                 if !(is_numeric(&a) || a == Type::Bool) {
                     return Err(TypeError::BadOperand {
-                        op: callee.into(),
+                        op: callee.clone(),
                         ty: a,
                         span: a_span,
                     });
@@ -734,7 +962,7 @@ impl TypeCk {
             "and" | "or" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 2,
                         got: args.len(),
                         span: call_span,
@@ -750,7 +978,7 @@ impl TypeCk {
             "not" => {
                 if args.len() != 1 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: args.len(),
                         span: call_span,
@@ -764,7 +992,7 @@ impl TypeCk {
             "print" | "println" => {
                 if args.len() != 1 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: args.len(),
                         span: call_span,
@@ -777,7 +1005,7 @@ impl TypeCk {
                         Ok(Type::Unit)
                     }
                     other => Err(TypeError::BadOperand {
-                        op: callee.into(),
+                        op: callee.clone(),
                         ty: other,
                         span: s,
                     }),
@@ -786,7 +1014,7 @@ impl TypeCk {
             "str-concat" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 2,
                         got: args.len(),
                         span: call_span,
@@ -802,7 +1030,7 @@ impl TypeCk {
             "str-len" => {
                 if args.len() != 1 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: args.len(),
                         span: call_span,
@@ -816,7 +1044,7 @@ impl TypeCk {
             "aget" => {
                 if args.len() != 2 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 2,
                         got: args.len(),
                         span: call_span,
@@ -826,7 +1054,7 @@ impl TypeCk {
                 let at = self.check_expr(&mut args[0], env)?;
                 let Type::Array { elem, .. } = at else {
                     return Err(TypeError::BadOperand {
-                        op: callee.into(),
+                        op: callee.clone(),
                         ty: at,
                         span: a_span,
                     });
@@ -839,7 +1067,7 @@ impl TypeCk {
             "aset!" => {
                 if args.len() != 3 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 3,
                         got: args.len(),
                         span: call_span,
@@ -849,7 +1077,7 @@ impl TypeCk {
                 let at = self.check_expr(&mut args[0], env)?;
                 let Type::Array { elem, .. } = at else {
                     return Err(TypeError::BadOperand {
-                        op: callee.into(),
+                        op: callee.clone(),
                         ty: at,
                         span: a_span,
                     });
@@ -865,7 +1093,7 @@ impl TypeCk {
             "alen" => {
                 if args.len() != 1 {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: 1,
                         got: args.len(),
                         span: call_span,
@@ -875,7 +1103,7 @@ impl TypeCk {
                 let at = self.check_expr(&mut args[0], env)?;
                 if !matches!(at, Type::Array { .. }) {
                     return Err(TypeError::BadOperand {
-                        op: callee.into(),
+                        op: callee.clone(),
                         ty: at,
                         span: a_span,
                     });
@@ -885,12 +1113,12 @@ impl TypeCk {
             _ => {
                 let sig = self
                     .fns
-                    .get(callee)
+                    .get(callee.as_str())
                     .cloned()
-                    .ok_or_else(|| TypeError::UndefinedFn(callee.to_string(), call_span))?;
+                    .ok_or_else(|| TypeError::UndefinedFn(callee.clone(), call_span))?;
                 if sig.params.len() != args.len() {
                     return Err(TypeError::Arity {
-                        name: callee.into(),
+                        name: callee.clone(),
                         expected: sig.params.len(),
                         got: args.len(),
                         span: call_span,

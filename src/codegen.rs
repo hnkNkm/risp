@@ -1,7 +1,7 @@
 //! LLVM IR codegen using inkwell.
 
 use crate::ast::*;
-use crate::typeck::{TypeCk, VariantInfo};
+use crate::typeck::{TypeCk, VariantInfo, mangle_method};
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -136,7 +136,7 @@ impl<'ctx> Codegen<'ctx> {
             self.module.add_function("risp_str_cstr", cstr_ty, None),
         );
 
-        // declare all user / extern functions first (allow forward refs)
+        // declare all user / extern / impl methods first (allow forward refs)
         for it in &prog.items {
             match it {
                 TopLevel::Function(f) => {
@@ -154,6 +154,17 @@ impl<'ctx> Codegen<'ctx> {
                     self.fn_types
                         .insert(e.name.clone(), (params, e.ret.clone()));
                 }
+                TopLevel::Impl(ib) => {
+                    for m in &ib.methods {
+                        let mangled = mangle_method(&ib.trait_name, &ib.for_ty, &m.name);
+                        let params: Vec<Type> = m.params.iter().map(|p| p.ty.clone()).collect();
+                        let fn_ty = self.fn_type_for_decl(&params, &m.ret, false);
+                        let fv = self.module.add_function(&mangled, fn_ty, None);
+                        self.fns.insert(mangled.clone(), fv);
+                        self.fn_types
+                            .insert(mangled, (params, m.ret.clone()));
+                    }
+                }
                 _ => {}
             }
         }
@@ -166,10 +177,26 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // emit function bodies
+        // emit function / impl method bodies
         for it in &prog.items {
-            if let TopLevel::Function(f) = it {
-                self.emit_function(f)?;
+            match it {
+                TopLevel::Function(f) => {
+                    self.emit_function(f)?;
+                }
+                TopLevel::Impl(ib) => {
+                    for m in &ib.methods {
+                        let mangled = mangle_method(&ib.trait_name, &ib.for_ty, &m.name);
+                        let synthetic = Function {
+                            name: mangled,
+                            params: m.params.clone(),
+                            ret: m.ret.clone(),
+                            body: m.body.clone(),
+                            span: m.span,
+                        };
+                        self.emit_function(&synthetic)?;
+                    }
+                }
+                _ => {}
             }
         }
 
