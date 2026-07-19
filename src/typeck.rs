@@ -26,6 +26,10 @@ pub enum TypeError {
     ConstNotLiteral(Span),
     #[error("cannot assign to constant {0:?}")]
     AssignConst(String, Span),
+    #[error("array element type {0} is not supported")]
+    BadArrayElem(Type, Span),
+    #[error("arrays cannot be used as function parameters or return types yet")]
+    ArrayInSignature(Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -43,7 +47,9 @@ impl TypeError {
             | TypeError::BadCast { span: s, .. }
             | TypeError::Duplicate(_, s)
             | TypeError::ConstNotLiteral(s)
-            | TypeError::AssignConst(_, s) => Some(*s),
+            | TypeError::AssignConst(_, s)
+            | TypeError::BadArrayElem(_, s)
+            | TypeError::ArrayInSignature(s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -80,6 +86,14 @@ impl TypeCk {
                 TopLevel::Function(f) => {
                     if self.fns.contains_key(&f.name) || self.consts.contains_key(&f.name) {
                         return Err(TypeError::Duplicate(f.name.clone(), f.span));
+                    }
+                    for p in &f.params {
+                        if matches!(p.ty, Type::Array { .. }) {
+                            return Err(TypeError::ArrayInSignature(p.span));
+                        }
+                    }
+                    if matches!(f.ret, Type::Array { .. }) {
+                        return Err(TypeError::ArrayInSignature(f.span));
                     }
                     let sig = FnSig {
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),
@@ -233,6 +247,20 @@ impl TypeCk {
                 let _ = self.check_expr(body, env)?;
                 Type::Unit
             }
+            ExprKind::ArrayLit { elem_ty, elems } => {
+                if !elem_ty.is_array_elem_allowed() {
+                    return Err(TypeError::BadArrayElem(elem_ty.clone(), span));
+                }
+                for el in elems.iter_mut() {
+                    let s = el.span;
+                    let t = self.check_expr(el, env)?;
+                    expect(elem_ty, &t, s)?;
+                }
+                Type::Array {
+                    elem: Box::new(elem_ty.clone()),
+                    len: elems.len() as u32,
+                }
+            }
             ExprKind::Call { callee, args } => {
                 let callee = callee.clone();
                 self.check_call(&callee, args, env, span)?
@@ -361,6 +389,75 @@ impl TypeCk {
                         span: s,
                     }),
                 }
+            }
+            "aget" => {
+                if args.len() != 2 {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 2,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env)?;
+                let Type::Array { elem, .. } = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.into(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                let i_span = args[1].span;
+                let it = self.check_expr(&mut args[1], env)?;
+                expect(&Type::I32, &it, i_span)?;
+                Ok(*elem)
+            }
+            "aset!" => {
+                if args.len() != 3 {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 3,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env)?;
+                let Type::Array { elem, .. } = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.into(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                let i_span = args[1].span;
+                let it = self.check_expr(&mut args[1], env)?;
+                expect(&Type::I32, &it, i_span)?;
+                let v_span = args[2].span;
+                let vt = self.check_expr(&mut args[2], env)?;
+                expect(&elem, &vt, v_span)?;
+                Ok(Type::Unit)
+            }
+            "alen" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.into(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env)?;
+                if !matches!(at, Type::Array { .. }) {
+                    return Err(TypeError::BadOperand {
+                        op: callee.into(),
+                        ty: at,
+                        span: a_span,
+                    });
+                }
+                Ok(Type::I32)
             }
             // user-defined function
             _ => {

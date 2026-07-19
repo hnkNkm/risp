@@ -1,0 +1,18 @@
+; Fixed-length arrays with aget / aset! / alen + while.
+;;! stdout: ok: array
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [a: (Array i32 5) (array i32 1 2 3 4 5)
+        i: i32 0
+        acc: i32 0
+        n: i32 (alen a)]
+    (do
+      (while (< i n)
+        (do
+          (set! acc (+ acc (aget a i)))
+          (set! i (+ i 1))))
+      (aset! a 0 100)
+      (if (and (= acc 15) (= (aget a 0) 100))
+        (do (println "ok: array") 0)
+        (do (println "FAIL: array") 1)))))

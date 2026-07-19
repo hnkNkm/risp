@@ -30,20 +30,31 @@ pub enum Type {
     Bool,
     Str,
     Unit,
+    /// Fixed-length array. Values are represented as pointers to stack storage.
+    Array { elem: Box<Type>, len: u32 },
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Type::I32 => "i32",
-            Type::I64 => "i64",
-            Type::F32 => "f32",
-            Type::F64 => "f64",
-            Type::Bool => "bool",
-            Type::Str => "str",
-            Type::Unit => "unit",
-        };
-        f.write_str(s)
+        match self {
+            Type::I32 => f.write_str("i32"),
+            Type::I64 => f.write_str("i64"),
+            Type::F32 => f.write_str("f32"),
+            Type::F64 => f.write_str("f64"),
+            Type::Bool => f.write_str("bool"),
+            Type::Str => f.write_str("str"),
+            Type::Unit => f.write_str("unit"),
+            Type::Array { elem, len } => write!(f, "(Array {elem} {len})"),
+        }
+    }
+}
+
+impl Type {
+    pub fn is_array_elem_allowed(&self) -> bool {
+        matches!(
+            self,
+            Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool
+        )
     }
 }
 
@@ -127,6 +138,11 @@ pub enum ExprKind {
     While {
         cond: Box<Expr>,
         body: Box<Expr>,
+    },
+    /// `(array T e1 e2 ... en)` — fixed array literal
+    ArrayLit {
+        elem_ty: Type,
+        elems: Vec<Expr>,
     },
     /// Function call or builtin operator: `(f a b ...)`
     Call {

@@ -177,18 +177,63 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
-        let t = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let t = self.peek().ok_or(ParseError::UnexpectedEof)?;
         match &t.tok {
-            Token::Ident(s) => match s.as_str() {
-                "i32" => Ok(Type::I32),
-                "i64" => Ok(Type::I64),
-                "f32" => Ok(Type::F32),
-                "f64" => Ok(Type::F64),
-                "bool" => Ok(Type::Bool),
-                "str" => Ok(Type::Str),
-                "unit" => Ok(Type::Unit),
-                other => Err(ParseError::UnknownType(other.to_string(), t.span.start)),
-            },
+            Token::Ident(_) => {
+                let t = self.bump().unwrap();
+                match &t.tok {
+                    Token::Ident(s) => match s.as_str() {
+                        "i32" => Ok(Type::I32),
+                        "i64" => Ok(Type::I64),
+                        "f32" => Ok(Type::F32),
+                        "f64" => Ok(Type::F64),
+                        "bool" => Ok(Type::Bool),
+                        "str" => Ok(Type::Str),
+                        "unit" => Ok(Type::Unit),
+                        other => Err(ParseError::UnknownType(other.to_string(), t.span.start)),
+                    },
+                    _ => unreachable!(),
+                }
+            }
+            Token::LParen => {
+                let lp = self.bump().unwrap();
+                let start = lp.span.start;
+                let head = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let head_name = match &head.tok {
+                    Token::Ident(s) => s.as_str(),
+                    other => {
+                        return Err(ParseError::Unexpected(format!("{:?}", other), head.span.start));
+                    }
+                };
+                if head_name != "Array" {
+                    return Err(ParseError::UnknownType(head_name.to_string(), head.span.start));
+                }
+                let elem = self.parse_type()?;
+                let len_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let len = match &len_tok.tok {
+                    Token::Int(v, _) if *v >= 0 && *v <= u32::MAX as i64 => *v as u32,
+                    Token::Int(..) => {
+                        return Err(ParseError::Expected {
+                            expected: "non-negative array length fitting u32",
+                            found: format!("{:?}", len_tok.tok),
+                            at: len_tok.span.start,
+                        });
+                    }
+                    other => {
+                        return Err(ParseError::Expected {
+                            expected: "array length (int literal)",
+                            found: format!("{:?}", other),
+                            at: len_tok.span.start,
+                        });
+                    }
+                };
+                self.eat(&Token::RParen)?;
+                let _ = start;
+                Ok(Type::Array {
+                    elem: Box::new(elem),
+                    len,
+                })
+            }
             other => Err(ParseError::Unexpected(format!("{:?}", other), t.span.start)),
         }
     }
@@ -343,6 +388,19 @@ impl<'a> Parser<'a> {
                         cond: Box::new(cond),
                         body: Box::new(body),
                     },
+                    Span::new(start, rp.span.end),
+                ))
+            }
+            Some("array") => {
+                self.bump();
+                let elem_ty = self.parse_type()?;
+                let mut elems = Vec::new();
+                while !matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+                    elems.push(self.parse_expr()?);
+                }
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::ArrayLit { elem_ty, elems },
                     Span::new(start, rp.span.end),
                 ))
             }

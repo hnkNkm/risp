@@ -204,17 +204,7 @@ impl<'ctx> Codegen<'ctx> {
                     .get_parent()
                     .unwrap();
                 for b in bindings {
-                    let v = self
-                        .emit_expr(&b.value)?
-                        .ok_or_else(|| CodegenError::Internal("let value".into()))?;
-                    let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
-                    self.builder
-                        .build_store(alloca, v)
-                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                    prev.push((
-                        b.name.clone(),
-                        self.locals.insert(b.name.clone(), (alloca, b.ty.clone())),
-                    ));
+                    prev.push(self.bind_local(fv, b)?);
                 }
                 self.emit_tail(body, ret_ty)?;
                 // Body always terminates; restore is only for map hygiene if we
@@ -308,6 +298,10 @@ impl<'ctx> Codegen<'ctx> {
             Some(inst) => tmp_builder.position_before(&inst),
             None => tmp_builder.position_at_end(entry),
         }
+        if let Type::Array { elem, len } = ty {
+            let at = llvm_array_type(self.context, elem, *len);
+            return tmp_builder.build_alloca(at, name).unwrap();
+        }
         let bt = basic_type(self.context, ty);
         match bt {
             BasicTypeEnum::IntType(t) => tmp_builder.build_alloca(t, name).unwrap(),
@@ -328,12 +322,17 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Lit(l) => Ok(Some(self.emit_lit(l, &ty))),
             ExprKind::Var(name) => {
                 if let Some((ptr, vty)) = self.locals.get(name).cloned() {
-                    let bt = basic_type(self.context, &vty);
-                    let v = self
-                        .builder
-                        .build_load(bt, ptr, name)
-                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                    Ok(Some(v))
+                    // Array locals store the alloca address itself (no load).
+                    if matches!(vty, Type::Array { .. }) {
+                        Ok(Some(ptr.into()))
+                    } else {
+                        let bt = basic_type(self.context, &vty);
+                        let v = self
+                            .builder
+                            .build_load(bt, ptr, name)
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                        Ok(Some(v))
+                    }
                 } else if let Some((_, v)) = self.consts.get(name) {
                     Ok(Some(*v))
                 } else {
@@ -381,12 +380,7 @@ impl<'ctx> Codegen<'ctx> {
                 let mut prev: Vec<(String, Option<(PointerValue<'ctx>, Type)>)> = Vec::new();
                 let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 for b in bindings {
-                    let v = self
-                        .emit_expr(&b.value)?
-                        .ok_or_else(|| CodegenError::Internal("let value".into()))?;
-                    let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
-                    self.builder.build_store(alloca, v).map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                    prev.push((b.name.clone(), self.locals.insert(b.name.clone(), (alloca, b.ty.clone()))));
+                    prev.push(self.bind_local(fv, b)?);
                 }
                 let result = self.emit_expr(body)?;
                 // restore
@@ -416,22 +410,163 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self
                     .emit_expr(value)?
                     .ok_or_else(|| CodegenError::Internal("set! value".into()))?;
-                let (ptr, _) = self
+                let (ptr, vty) = self
                     .locals
                     .get(name)
                     .cloned()
                     .ok_or_else(|| CodegenError::Internal(format!("set! unresolved {name}")))?;
-                self.builder
-                    .build_store(ptr, v)
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                if matches!(vty, Type::Array { .. }) {
+                    // Rebind the local to a new array pointer (no element-wise copy).
+                    self.locals
+                        .insert(name.clone(), (v.into_pointer_value(), vty));
+                } else {
+                    self.builder
+                        .build_store(ptr, v)
+                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                }
                 Ok(None)
             }
             ExprKind::While { cond, body } => {
                 self.emit_while(cond, body)?;
                 Ok(None)
             }
+            ExprKind::ArrayLit { elem_ty, elems } => {
+                Ok(Some(self.emit_array_lit(elem_ty, elems)?.into()))
+            }
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
+    }
+
+    /// Bind a `let` local. Arrays keep the pointer from the initializer (no copy).
+    fn bind_local(
+        &mut self,
+        fv: FunctionValue<'ctx>,
+        b: &Binding,
+    ) -> Result<(String, Option<(PointerValue<'ctx>, Type)>), CodegenError> {
+        let v = self
+            .emit_expr(&b.value)?
+            .ok_or_else(|| CodegenError::Internal("let value".into()))?;
+        let ptr = if matches!(b.ty, Type::Array { .. }) {
+            v.into_pointer_value()
+        } else {
+            let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
+            self.builder
+                .build_store(alloca, v)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            alloca
+        };
+        Ok((
+            b.name.clone(),
+            self.locals.insert(b.name.clone(), (ptr, b.ty.clone())),
+        ))
+    }
+
+    fn emit_array_lit(
+        &mut self,
+        elem_ty: &Type,
+        elems: &[Expr],
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let len = elems.len() as u32;
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let arr_ty = llvm_array_type(self.context, elem_ty, len);
+        let alloca = {
+            let entry = fv.get_first_basic_block().unwrap();
+            let tmp_builder = self.context.create_builder();
+            match entry.get_first_instruction() {
+                Some(inst) => tmp_builder.position_before(&inst),
+                None => tmp_builder.position_at_end(entry),
+            }
+            tmp_builder.build_alloca(arr_ty, "arrtmp").unwrap()
+        };
+        let zero = self.context.i32_type().const_int(0, false);
+        for (i, el) in elems.iter().enumerate() {
+            let v = self
+                .emit_expr(el)?
+                .ok_or_else(|| CodegenError::Internal("array elem".into()))?;
+            let idx = self.context.i32_type().const_int(i as u64, false);
+            let ep = unsafe {
+                self.builder
+                    .build_in_bounds_gep(arr_ty, alloca, &[zero, idx], "elemptr")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            };
+            self.builder
+                .build_store(ep, v)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+        Ok(alloca)
+    }
+
+    fn emit_aget(&mut self, args: &[Expr]) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let arr_ast_ty = Self::expr_ty(&args[0])?.clone();
+        let Type::Array { elem, len } = arr_ast_ty else {
+            return Err(CodegenError::Internal("aget on non-array".into()));
+        };
+        let arr_ptr = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("aget arr".into()))?
+            .into_pointer_value();
+        let idx = self
+            .emit_expr(&args[1])?
+            .ok_or_else(|| CodegenError::Internal("aget idx".into()))?
+            .into_int_value();
+        let arr_ty = llvm_array_type(self.context, &elem, len);
+        let zero = self.context.i32_type().const_int(0, false);
+        let ep = unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, arr_ptr, &[zero, idx], "agetptr")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+        };
+        let bt = basic_type(self.context, &elem);
+        self.builder
+            .build_load(bt, ep, "aget")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))
+    }
+
+    fn emit_aset(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
+        let arr_ast_ty = Self::expr_ty(&args[0])?.clone();
+        let Type::Array { elem, len } = arr_ast_ty else {
+            return Err(CodegenError::Internal("aset! on non-array".into()));
+        };
+        let arr_ptr = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("aset! arr".into()))?
+            .into_pointer_value();
+        let idx = self
+            .emit_expr(&args[1])?
+            .ok_or_else(|| CodegenError::Internal("aset! idx".into()))?
+            .into_int_value();
+        let val = self
+            .emit_expr(&args[2])?
+            .ok_or_else(|| CodegenError::Internal("aset! val".into()))?;
+        let arr_ty = llvm_array_type(self.context, &elem, len);
+        let zero = self.context.i32_type().const_int(0, false);
+        let ep = unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, arr_ptr, &[zero, idx], "asetptr")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+        };
+        self.builder
+            .build_store(ep, val)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(())
+    }
+
+    fn emit_alen(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let arr_ast_ty = Self::expr_ty(&args[0])?.clone();
+        let Type::Array { len, .. } = arr_ast_ty else {
+            return Err(CodegenError::Internal("alen on non-array".into()));
+        };
+        // Evaluate for sequencing; length is known statically.
+        let _ = self.emit_expr(&args[0])?;
+        Ok(self.context.i32_type().const_int(len as u64, false))
     }
 
     fn emit_while(&mut self, cond: &Expr, body: &Expr) -> Result<(), CodegenError> {
@@ -572,6 +707,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.emit_print(args, false)?;
                 Ok(None)
             }
+            "aget" => Ok(Some(self.emit_aget(args)?)),
+            "aset!" => {
+                self.emit_aset(args)?;
+                Ok(None)
+            }
+            "alen" => Ok(Some(self.emit_alen(args)?.into())),
             _ => {
                 let fv = *self
                     .fns
@@ -775,8 +916,8 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = selected.into_pointer_value();
                 ("%s", ptr.into())
             }
-            Type::Unit => {
-                return Err(CodegenError::Internal("cannot print unit".into()));
+            Type::Unit | Type::Array { .. } => {
+                return Err(CodegenError::Internal("cannot print this type".into()));
             }
         };
 
@@ -916,8 +1057,23 @@ fn basic_type<'ctx>(ctx: &'ctx Context, t: &Type) -> BasicTypeEnum<'ctx> {
         Type::F32 => ctx.f32_type().into(),
         Type::F64 => ctx.f64_type().into(),
         Type::Bool => ctx.bool_type().into(),
-        Type::Str => ctx.ptr_type(AddressSpace::default()).into(),
+        Type::Str | Type::Array { .. } => ctx.ptr_type(AddressSpace::default()).into(),
         Type::Unit => panic!("unit has no basic type"),
+    }
+}
+
+fn llvm_array_type<'ctx>(
+    ctx: &'ctx Context,
+    elem: &Type,
+    len: u32,
+) -> inkwell::types::ArrayType<'ctx> {
+    match elem {
+        Type::I32 => ctx.i32_type().array_type(len),
+        Type::I64 => ctx.i64_type().array_type(len),
+        Type::F32 => ctx.f32_type().array_type(len),
+        Type::F64 => ctx.f64_type().array_type(len),
+        Type::Bool => ctx.bool_type().array_type(len),
+        other => panic!("unsupported array element type {other}"),
     }
 }
 

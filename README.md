@@ -40,6 +40,7 @@ ok: f64 cmp
 | `f64` | 64bit浮動小数点 |
 | `bool` | 真偽値 |
 | `str` | 静的文字列（コンパイル時定数のみ。動的Stringは将来対応） |
+| `(Array T N)` | 固定長配列（要素は数値 / `bool`。ローカルのみ。代入は参照意味論） |
 
 ### メモリ管理（MVP方針）
 
@@ -74,6 +75,12 @@ ok: f64 cmp
   (do
     (set! acc (+ acc i))
     (set! i (+ i 1))))
+
+;; 固定長配列
+(let [a: (Array i32 3) (array i32 1 2 3)]
+  (do
+    (aset! a 0 10)
+    (+ (aget a 0) (alen a))))
 
 ;; 条件分岐
 (if (< x 0) (- x) x)
@@ -122,6 +129,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | キャスト | `(as T e)`（数値型間） |
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
 | ループ | `(while cond body)`（値は Unit。`break` は未実装） |
+| 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
 
 ### 評価戦略
