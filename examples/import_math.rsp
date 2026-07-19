@@ -1,0 +1,10 @@
+; Import a sibling module and call a qualified name.
+;;! stdout: ok: modules
+;;! exit: 0
+
+(import math)
+
+(defn main [] -> i32
+  (if (= (math/add 2 3) 5)
+    (do (println "ok: modules") 0)
+    1))

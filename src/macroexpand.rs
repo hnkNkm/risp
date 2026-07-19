@@ -70,7 +70,9 @@ pub fn expand(prog: &mut Program) -> Result<(), MacroError> {
             | TopLevel::Enum(_)
             | TopLevel::Extern(_)
             | TopLevel::Trait(_)
-            | TopLevel::DefMacro(_) => {}
+            | TopLevel::DefMacro(_)
+            | TopLevel::Module { .. }
+            | TopLevel::Import { .. } => {}
         }
     }
     Ok(())

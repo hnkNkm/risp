@@ -152,6 +152,8 @@ fn is_ident_start(c: char) -> bool {
 }
 
 fn is_ident_continue(c: char) -> bool {
+    // `/` is included via `is_ident_start`, so qualified names like `math/add`
+    // lex as a single Ident.
     is_ident_start(c) || c.is_ascii_digit()
 }
 
@@ -280,5 +282,15 @@ mod tests {
     fn lex_comment() {
         let toks = lex("; this is a comment\n42").unwrap();
         assert_eq!(toks.len(), 1);
+    }
+
+    #[test]
+    fn lex_qualified_ident() {
+        let toks = lex("math/add").unwrap();
+        assert_eq!(toks.len(), 1);
+        match &toks[0].tok {
+            Token::Ident(s) => assert_eq!(s, "math/add"),
+            other => panic!("expected Ident, got {other:?}"),
+        }
     }
 }

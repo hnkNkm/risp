@@ -4,6 +4,7 @@ use crate::codegen::Codegen;
 use crate::diagnostic::{Loc, render};
 use crate::macroexpand;
 use crate::parser::{self, FrontendError};
+use crate::resolve;
 use crate::typeck::{self, TypeCk};
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
@@ -127,6 +128,7 @@ impl Session {
         trial.push(input.to_string());
         let src = trial.join("\n");
         let mut prog = parser::parse(&src).map_err(|e| render_frontend("<repl>", &src, &e))?;
+        resolve::prepare_repl(&mut prog).map_err(|e| plain(e))?;
         macroexpand::expand(&mut prog).map_err(|e| render_macro("<repl>", &src, &e))?;
         let mut tyck = TypeCk::new();
         tyck.check_ex(&mut prog, false)
@@ -145,6 +147,7 @@ impl Session {
         ));
         let src = parts.join("\n");
         let mut prog = parser::parse(&src).map_err(|e| render_frontend("<repl>", &src, &e))?;
+        resolve::prepare_repl(&mut prog).map_err(|e| plain(e))?;
         macroexpand::expand(&mut prog).map_err(|e| render_macro("<repl>", &src, &e))?;
         let mut tyck = TypeCk::new();
         tyck.check_ex(&mut prog, false)
@@ -186,6 +189,8 @@ fn is_definition(src: &str) -> bool {
         || t.starts_with("(extern")
         || t.starts_with("(trait")
         || t.starts_with("(impl")
+        || t.starts_with("(import")
+        || t.starts_with("(module")
 }
 
 /// Net open paren/bracket count. Ignores contents of string literals.

@@ -302,6 +302,10 @@ pub enum TopLevel {
     Trait(TraitDef),
     Impl(ImplBlock),
     DefMacro(MacroDef),
+    /// `(module name)` — optional; file stem is used when absent. Stripped by resolve.
+    Module { name: String, span: Span },
+    /// `(import name)` — load `name.rsp` and merge prefixed items. Stripped by resolve.
+    Import { name: String, span: Span },
 }
 
 #[derive(Debug, Clone)]

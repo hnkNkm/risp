@@ -117,6 +117,42 @@ impl<'a> Parser<'a> {
                 let m = self.parse_defmacro_body(start)?;
                 Ok(TopLevel::DefMacro(m))
             }
+            "module" => {
+                let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let name = match &name_tok.tok {
+                    Token::Ident(s) => s.clone(),
+                    other => {
+                        return Err(ParseError::Expected {
+                            expected: "module name",
+                            found: format!("{other:?}"),
+                            at: name_tok.span.start,
+                        });
+                    }
+                };
+                let end = self.eat(&Token::RParen)?.span.end;
+                Ok(TopLevel::Module {
+                    name,
+                    span: Span::new(start, end),
+                })
+            }
+            "import" => {
+                let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let name = match &name_tok.tok {
+                    Token::Ident(s) => s.clone(),
+                    other => {
+                        return Err(ParseError::Expected {
+                            expected: "import name",
+                            found: format!("{other:?}"),
+                            at: name_tok.span.start,
+                        });
+                    }
+                };
+                let end = self.eat(&Token::RParen)?.span.end;
+                Ok(TopLevel::Import {
+                    name,
+                    span: Span::new(start, end),
+                })
+            }
             other => Err(ParseError::Unexpected(
                 format!("top-level form {:?}", other),
                 head.span.start,
@@ -1154,6 +1190,42 @@ mod tests {
         }
         match &prog.items[2] {
             TopLevel::Function(f) => assert_eq!(f.name, "add"),
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_module_import() {
+        let src = r#"
+        (module math)
+        (import util)
+        (defn add [x: i32, y: i32] -> i32 (+ x y))
+        "#;
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.items.len(), 3);
+        match &prog.items[0] {
+            TopLevel::Module { name, .. } => assert_eq!(name, "math"),
+            other => panic!("expected Module, got {other:?}"),
+        }
+        match &prog.items[1] {
+            TopLevel::Import { name, .. } => assert_eq!(name, "util"),
+            other => panic!("expected Import, got {other:?}"),
+        }
+        match &prog.items[2] {
+            TopLevel::Function(f) => assert_eq!(f.name, "add"),
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_call() {
+        let src = "(defn main [] -> i32 (math/add 2 3))";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            TopLevel::Function(f) => match &f.body.kind {
+                ExprKind::Call { callee, .. } => assert_eq!(callee, "math/add"),
+                other => panic!("expected Call, got {other:?}"),
+            },
             other => panic!("expected Function, got {other:?}"),
         }
     }

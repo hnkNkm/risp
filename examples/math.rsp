@@ -1,0 +1,4 @@
+; Library module (no main). Skipped by e2e when no ;;! expectations.
+(module math)
+
+(defn add [x: i32, y: i32] -> i32 (+ x y))
