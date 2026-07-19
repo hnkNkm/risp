@@ -1,0 +1,20 @@
+; Generic identity + trait-bound generic (monomorphization).
+;;! stdout: ok: generics
+;;! exit: 0
+
+(defn id [T] [x: T] -> T x)
+
+(trait Show
+  (show [self] -> str))
+
+(impl Show for i32
+  (show [self] -> str
+    "ok: generics"))
+
+(defn print-show [T: Show] [x: T] -> unit
+  (println (show x)))
+
+(defn main [] -> i32
+  (do
+    (print-show (id 1))
+    0))

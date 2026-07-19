@@ -11,7 +11,7 @@ Rustの型システムを持つLispライクなプログラミング言語。LLV
 - S式構文を採用したLisp系言語
 - Rust由来の静的型システム（i32 / i64 / f32 / f64 / bool / str など）
 - LLVMバックエンドによるネイティブコード生成
-- 将来的にマクロ・ジェネリクスを導入（struct / enum / trait/impl は MVP 済み）
+- 将来的にマクロを導入（struct / enum / trait/impl / ジェネリクス単相化は MVP 済み）
 
 ## 現状（Phase 1: MVP 完了）
 
@@ -106,6 +106,12 @@ ok: f64 cmp
     "i32"))
 (println (show 1))
 
+;; ジェネリクス（型パラメータは値パラメータの前の `[]`。単相化）
+(defn id [T] [x: T] -> T x)
+(defn print-show [T: Show] [x: T] -> unit
+  (println (show x)))
+(print-show (id 1))
+
 ;; 条件分岐
 (if (< x 0) (- x) x)
 
@@ -156,6 +162,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
 | trait | `(trait Name (method [self ...] -> T)*)` / `(impl Name for T ...)`（静的ディスパッチ。先頭引数は bare `self` 可） |
+| ジェネリクス | `(defn f [T] [x: T] -> T ...)` / `(defn f [T: Trait] [x: T] -> ...)`（呼び出し時に単相化。struct/enum は未対応） |
 | FFI | `(extern "C" name [params] -> ret)`（プリミティブ / `str`。`str` は C 文字列に変換） |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
@@ -290,7 +297,7 @@ cargo run -- run examples/hello.rsp
 
 ### Phase 4 — 抽象化
 - [x] trait / impl（静的ディスパッチ MVP。メソッド名は trait 間で一意）
-- [ ] ジェネリクス（モノモーフィゼーション）
+- [x] ジェネリクス（`defn` の単相化 MVP。型パラメータ + trait bound）
 - [ ] マクロ（defmacro）
 - [x] REPL（inkwell::execution_engine でJIT）
 

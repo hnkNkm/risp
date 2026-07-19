@@ -226,6 +226,18 @@ pub struct Function {
     pub span: Span,
 }
 
+/// Generic function template. Not emitted until monomorphized.
+/// `type_params`: `(Name, OptionalTraitBound)`.
+#[derive(Debug, Clone)]
+pub struct GenericFunction {
+    pub name: String,
+    pub type_params: Vec<(String, Option<String>)>,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub body: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Const {
     pub name: String,
@@ -272,6 +284,7 @@ pub struct ImplBlock {
 #[derive(Debug, Clone)]
 pub enum TopLevel {
     Function(Function),
+    GenericFunction(GenericFunction),
     Const(Const),
     Struct(StructDef),
     Enum(EnumDef),
