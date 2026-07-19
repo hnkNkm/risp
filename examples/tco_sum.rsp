@@ -1,0 +1,21 @@
+; Self-tail-call optimization: deep recursion must not blow the stack.
+;;! stdout: ok: tco
+;;! exit: 0
+
+(defn sum-to [n: i64, acc: i64] -> i64
+  (if (<= n 0i64)
+    acc
+    (sum-to (- n 1i64) (+ acc n))))
+
+;; Non-tail recursion still works (small n).
+(defn fact [n: i32] -> i32
+  (if (<= n 1)
+    1
+    (* n (fact (- n 1)))))
+
+(defn main [] -> i32
+  (let [s: i64 (sum-to 100000i64 0i64)
+        f: i32 (fact 10)]
+    (if (and (= s 5000050000i64) (= f 3628800))
+      (do (println "ok: tco") 0)
+      (do (println "FAIL: tco") 1))))
