@@ -426,8 +426,46 @@ impl<'ctx> Codegen<'ctx> {
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 Ok(None)
             }
+            ExprKind::While { cond, body } => {
+                self.emit_while(cond, body)?;
+                Ok(None)
+            }
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
+    }
+
+    fn emit_while(&mut self, cond: &Expr, body: &Expr) -> Result<(), CodegenError> {
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let cond_bb = self.context.append_basic_block(fv, "while.cond");
+        let body_bb = self.context.append_basic_block(fv, "while.body");
+        let end_bb = self.context.append_basic_block(fv, "while.end");
+
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(cond_bb);
+        let cv = self
+            .emit_expr(cond)?
+            .ok_or_else(|| CodegenError::Internal("while cond".into()))?
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(cv, body_bb, end_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(body_bb);
+        let _ = self.emit_expr(body)?;
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(end_bb);
+        Ok(())
     }
 
     fn emit_cast(

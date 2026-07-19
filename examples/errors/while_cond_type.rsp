@@ -1,0 +1,8 @@
+; while condition must be bool.
+;;! error_at: 7:12
+;;! error_contains: type mismatch
+
+(defn main [] -> i32
+  (do
+    (while 1 (do))
+    0))

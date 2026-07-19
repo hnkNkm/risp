@@ -1,0 +1,17 @@
+; while + set! for imperative accumulation.
+;;! stdout: ok: while
+;;! exit: 0
+
+(defn sum-to [n: i32] -> i32
+  (let [i: i32 1, acc: i32 0]
+    (do
+      (while (<= i n)
+        (do
+          (set! acc (+ acc i))
+          (set! i (+ i 1))))
+      acc)))
+
+(defn main [] -> i32
+  (if (= (sum-to 100) 5050)
+    (do (println "ok: while") 0)
+    (do (println "FAIL: while") 1)))
