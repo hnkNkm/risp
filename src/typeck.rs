@@ -61,6 +61,8 @@ pub enum TypeError {
     EmptyStruct(String, Span),
     #[error("enum {0:?} must have at least one variant")]
     EmptyEnum(String, Span),
+    #[error("`break` outside of loop")]
+    BreakOutsideLoop(Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -93,7 +95,8 @@ impl TypeError {
             | TypeError::MatchUnitBinding(_, s)
             | TypeError::MatchMissingBinding(_, s)
             | TypeError::EmptyStruct(_, s)
-            | TypeError::EmptyEnum(_, s) => Some(*s),
+            | TypeError::EmptyEnum(_, s)
+            | TypeError::BreakOutsideLoop(s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -119,6 +122,8 @@ pub struct TypeCk {
     pub enums: HashMap<String, EnumDef>,
     /// Variant constructor name -> info
     pub variants: HashMap<String, VariantInfo>,
+    /// Nesting depth of `while` / `loop` while checking expressions.
+    loop_depth: usize,
 }
 
 impl TypeCk {
@@ -129,6 +134,7 @@ impl TypeCk {
             structs: HashMap::new(),
             enums: HashMap::new(),
             variants: HashMap::new(),
+            loop_depth: 0,
         }
     }
 
@@ -299,7 +305,11 @@ impl TypeCk {
         }
     }
 
-    fn check_expr(&self, e: &mut Expr, env: &mut HashMap<String, Type>) -> Result<Type, TypeError> {
+    fn check_expr(
+        &mut self,
+        e: &mut Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> Result<Type, TypeError> {
         let span = e.span;
         let ty = match &mut e.kind {
             ExprKind::Lit(l) => {
@@ -397,7 +407,23 @@ impl TypeCk {
                 let cond_span = cond.span;
                 let ct = self.check_expr(cond, env)?;
                 expect(&Type::Bool, &ct, cond_span)?;
-                let _ = self.check_expr(body, env)?;
+                self.loop_depth += 1;
+                let body_res = self.check_expr(body, env);
+                self.loop_depth -= 1;
+                let _ = body_res?;
+                Type::Unit
+            }
+            ExprKind::Loop { body } => {
+                self.loop_depth += 1;
+                let body_res = self.check_expr(body, env);
+                self.loop_depth -= 1;
+                let _ = body_res?;
+                Type::Unit
+            }
+            ExprKind::Break => {
+                if self.loop_depth == 0 {
+                    return Err(TypeError::BreakOutsideLoop(span));
+                }
                 Type::Unit
             }
             ExprKind::ArrayLit { elem_ty, elems } => {
@@ -438,7 +464,7 @@ impl TypeCk {
     }
 
     fn check_match(
-        &self,
+        &mut self,
         scrutinee: &mut Expr,
         arms: &mut [MatchArm],
         env: &mut HashMap<String, Type>,
@@ -518,7 +544,7 @@ impl TypeCk {
 
     /// Check that all args are the same numeric type; return that type.
     fn check_numeric_args(
-        &self,
+        &mut self,
         op: &str,
         args: &mut [Expr],
         env: &mut HashMap<String, Type>,
@@ -541,14 +567,15 @@ impl TypeCk {
     }
 
     fn check_call(
-        &self,
+        &mut self,
         callee: &str,
         args: &mut [Expr],
         env: &mut HashMap<String, Type>,
         call_span: Span,
     ) -> Result<Type, TypeError> {
         // Struct constructor
-        if let Some(sdef) = self.structs.get(callee) {
+        if self.structs.contains_key(callee) {
+            let sdef = self.structs[callee].clone();
             if sdef.fields.len() != args.len() {
                 return Err(TypeError::Arity {
                     name: callee.into(),
@@ -562,11 +589,12 @@ impl TypeCk {
                 let at = self.check_expr(arg, env)?;
                 expect(&field.ty, &at, s)?;
             }
-            return Ok(Type::Named(sdef.name.clone()));
+            return Ok(Type::Named(sdef.name));
         }
 
         // Enum variant constructor
-        if let Some(info) = self.variants.get(callee) {
+        if self.variants.contains_key(callee) {
+            let info = self.variants[callee].clone();
             match &info.payload {
                 None => {
                     if !args.is_empty() {
@@ -592,7 +620,7 @@ impl TypeCk {
                     expect(pty, &at, s)?;
                 }
             }
-            return Ok(Type::Named(info.enum_name.clone()));
+            return Ok(Type::Named(info.enum_name));
         }
 
         // builtins first

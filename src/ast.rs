@@ -189,6 +189,12 @@ pub enum ExprKind {
         cond: Box<Expr>,
         body: Box<Expr>,
     },
+    /// `(loop body)` — infinite loop; value is unit (exit via `break`)
+    Loop {
+        body: Box<Expr>,
+    },
+    /// `(break)` — exit innermost while/loop; value is unit
+    Break,
     /// `(array T e1 e2 ... en)` — fixed array literal
     ArrayLit {
         elem_ty: Type,
