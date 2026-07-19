@@ -286,8 +286,16 @@ impl TypeCk {
                 }
                 let s = args[0].span;
                 let t = self.check_expr(&mut args[0], env)?;
-                expect(&Type::Str, &t, s)?;
-                Ok(Type::Unit)
+                match t {
+                    Type::Str | Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool => {
+                        Ok(Type::Unit)
+                    }
+                    other => Err(TypeError::BadOperand {
+                        op: callee.into(),
+                        ty: other,
+                        span: s,
+                    }),
+                }
             }
             // user-defined function
             _ => {

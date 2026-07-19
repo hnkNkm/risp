@@ -271,22 +271,11 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(Some(v.into()))
             }
             "println" => {
-                let s = self.emit_expr(&args[0])?.unwrap();
-                let puts = self.fns["__puts"];
-                let argv: [BasicMetadataValueEnum; 1] = [s.into()];
-                self.builder
-                    .build_call(puts, &argv, "putscall")
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.emit_print(args, true)?;
                 Ok(None)
             }
             "print" => {
-                let s = self.emit_expr(&args[0])?.unwrap();
-                let fmt = self.intern_str("%s");
-                let printf = self.fns["__printf"];
-                let argv: [BasicMetadataValueEnum; 2] = [fmt.into(), s.into()];
-                self.builder
-                    .build_call(printf, &argv, "printfcall")
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.emit_print(args, false)?;
                 Ok(None)
             }
             _ => {
@@ -449,6 +438,64 @@ impl<'ctx> Codegen<'ctx> {
             }
             other => Err(CodegenError::Internal(format!("neg on {other}"))),
         }
+    }
+
+    /// Print a value with `printf`. `newline` appends `\n` (or uses `puts` for `str`).
+    fn emit_print(&mut self, args: &[Expr], newline: bool) -> Result<(), CodegenError> {
+        let arg = &args[0];
+        let ty = Self::expr_ty(arg)?.clone();
+        let v = self
+            .emit_expr(arg)?
+            .ok_or_else(|| CodegenError::Internal("print arg".into()))?;
+
+        // Fast path: println of str → puts
+        if newline && ty == Type::Str {
+            let puts = self.fns["__puts"];
+            let argv: [BasicMetadataValueEnum; 1] = [v.into()];
+            self.builder
+                .build_call(puts, &argv, "putscall")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            return Ok(());
+        }
+
+        let printf = self.fns["__printf"];
+        let (fmt, arg_v): (&str, BasicMetadataValueEnum) = match ty {
+            Type::Str => ("%s", v.into()),
+            Type::I32 => ("%d", v.into()),
+            Type::I64 => ("%lld", v.into()),
+            Type::F64 => ("%g", v.into()),
+            Type::F32 => {
+                let ext = self
+                    .builder
+                    .build_float_ext(v.into_float_value(), self.context.f64_type(), "fpext")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                ("%g", ext.into())
+            }
+            Type::Bool => {
+                let true_s = self.intern_str("true");
+                let false_s = self.intern_str("false");
+                let selected = self
+                    .builder
+                    .build_select(v.into_int_value(), true_s, false_s, "boolstr")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                let ptr = selected.into_pointer_value();
+                ("%s", ptr.into())
+            }
+            Type::Unit => {
+                return Err(CodegenError::Internal("cannot print unit".into()));
+            }
+        };
+
+        let fmt_s = if newline {
+            self.intern_str(&format!("{fmt}\n"))
+        } else {
+            self.intern_str(fmt)
+        };
+        let argv: [BasicMetadataValueEnum; 2] = [fmt_s.into(), arg_v];
+        self.builder
+            .build_call(printf, &argv, "printfcall")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(())
     }
 
     fn emit_arith(
