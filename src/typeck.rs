@@ -63,6 +63,10 @@ pub enum TypeError {
     EmptyEnum(String, Span),
     #[error("`break` outside of loop")]
     BreakOutsideLoop(Span),
+    #[error("unsupported extern ABI {0:?} (only \"C\" is supported)")]
+    BadExternAbi(String, Span),
+    #[error("extern parameter/return type {0} is not supported")]
+    BadExternType(Type, Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -96,7 +100,9 @@ impl TypeError {
             | TypeError::MatchMissingBinding(_, s)
             | TypeError::EmptyStruct(_, s)
             | TypeError::EmptyEnum(_, s)
-            | TypeError::BreakOutsideLoop(s) => Some(*s),
+            | TypeError::BreakOutsideLoop(s)
+            | TypeError::BadExternAbi(_, s)
+            | TypeError::BadExternType(_, s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -122,6 +128,8 @@ pub struct TypeCk {
     pub enums: HashMap<String, EnumDef>,
     /// Variant constructor name -> info
     pub variants: HashMap<String, VariantInfo>,
+    /// Names declared via `(extern "C" …)`.
+    pub externs: HashMap<String, FnSig>,
     /// Nesting depth of `while` / `loop` while checking expressions.
     loop_depth: usize,
 }
@@ -134,8 +142,16 @@ impl TypeCk {
             structs: HashMap::new(),
             enums: HashMap::new(),
             variants: HashMap::new(),
+            externs: HashMap::new(),
             loop_depth: 0,
         }
+    }
+
+    fn is_extern_type_ok(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::Str | Type::Unit
+        )
     }
 
     pub fn check(&mut self, prog: &mut Program) -> Result<(), TypeError> {
@@ -150,6 +166,7 @@ impl TypeCk {
         self.structs.clear();
         self.enums.clear();
         self.variants.clear();
+        self.externs.clear();
 
         // Collect type definitions first.
         for it in &prog.items {
@@ -222,6 +239,32 @@ impl TypeCk {
                     };
                     self.fns.insert(f.name.clone(), sig);
                 }
+                TopLevel::Extern(e) => {
+                    if e.abi != "C" {
+                        return Err(TypeError::BadExternAbi(e.abi.clone(), e.span));
+                    }
+                    self.register_name(&e.name, e.span)?;
+                    for p in &e.params {
+                        if !Self::is_extern_type_ok(&p.ty) || matches!(p.ty, Type::Unit) {
+                            return Err(TypeError::BadExternType(p.ty.clone(), p.span));
+                        }
+                        if matches!(p.ty, Type::Named(_)) {
+                            return Err(TypeError::BadExternType(p.ty.clone(), p.span));
+                        }
+                    }
+                    if !Self::is_extern_type_ok(&e.ret) {
+                        return Err(TypeError::BadExternType(e.ret.clone(), e.span));
+                    }
+                    if matches!(e.ret, Type::Named(_) | Type::Array { .. }) {
+                        return Err(TypeError::BadExternType(e.ret.clone(), e.span));
+                    }
+                    let sig = FnSig {
+                        params: e.params.iter().map(|p| p.ty.clone()).collect(),
+                        ret: e.ret.clone(),
+                    };
+                    self.fns.insert(e.name.clone(), sig.clone());
+                    self.externs.insert(e.name.clone(), sig);
+                }
                 TopLevel::Const(c) => {
                     self.register_name(&c.name, c.span)?;
                     self.resolve_type(&c.ty, c.span)?;
@@ -273,7 +316,7 @@ impl TypeCk {
                     let ty = self.check_expr(&mut c.value, &mut env)?;
                     expect(&c.ty, &ty, val_span)?;
                 }
-                TopLevel::Struct(_) | TopLevel::Enum(_) => {}
+                TopLevel::Struct(_) | TopLevel::Enum(_) | TopLevel::Extern(_) => {}
             }
         }
         Ok(())
@@ -285,6 +328,7 @@ impl TypeCk {
             || self.structs.contains_key(name)
             || self.enums.contains_key(name)
             || self.variants.contains_key(name)
+            || self.externs.contains_key(name)
         {
             return Err(TypeError::Duplicate(name.to_string(), span));
         }

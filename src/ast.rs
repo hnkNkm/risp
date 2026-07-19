@@ -235,11 +235,21 @@ pub struct Const {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExternFn {
+    pub abi: String,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub enum TopLevel {
     Function(Function),
     Const(Const),
     Struct(StructDef),
     Enum(EnumDef),
+    Extern(ExternFn),
 }
 
 #[derive(Debug, Clone)]

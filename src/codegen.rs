@@ -45,6 +45,7 @@ pub struct Codegen<'ctx> {
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
     variants: HashMap<String, VariantInfo>,
+    externs: HashMap<String, crate::typeck::FnSig>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -68,6 +69,7 @@ impl<'ctx> Codegen<'ctx> {
             structs: HashMap::new(),
             enums: HashMap::new(),
             variants: HashMap::new(),
+            externs: HashMap::new(),
         }
     }
 
@@ -87,6 +89,7 @@ impl<'ctx> Codegen<'ctx> {
         self.structs = tyck.structs.clone();
         self.enums = tyck.enums.clone();
         self.variants = tyck.variants.clone();
+        self.externs = tyck.externs.clone();
 
         // declare external `puts(i8*) -> i32` for println
         let i32_ty = self.context.i32_type();
@@ -133,16 +136,25 @@ impl<'ctx> Codegen<'ctx> {
             self.module.add_function("risp_str_cstr", cstr_ty, None),
         );
 
-        // declare all user functions first (allow forward refs)
+        // declare all user / extern functions first (allow forward refs)
         for it in &prog.items {
-            if let TopLevel::Function(f) = it {
-                let fn_ty = self.fn_type(&f.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(), &f.ret);
-                let fv = self.module.add_function(&f.name, fn_ty, None);
-                self.fns.insert(f.name.clone(), fv);
-                self.fn_types.insert(
-                    f.name.clone(),
-                    (f.params.iter().map(|p| p.ty.clone()).collect(), f.ret.clone()),
-                );
+            match it {
+                TopLevel::Function(f) => {
+                    let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
+                    let fn_ty = self.fn_type_for_decl(&params, &f.ret, false);
+                    let fv = self.module.add_function(&f.name, fn_ty, None);
+                    self.fns.insert(f.name.clone(), fv);
+                    self.fn_types.insert(f.name.clone(), (params, f.ret.clone()));
+                }
+                TopLevel::Extern(e) => {
+                    let params: Vec<Type> = e.params.iter().map(|p| p.ty.clone()).collect();
+                    let fn_ty = self.fn_type_for_decl(&params, &e.ret, true);
+                    let fv = self.module.add_function(&e.name, fn_ty, None);
+                    self.fns.insert(e.name.clone(), fv);
+                    self.fn_types
+                        .insert(e.name.clone(), (params, e.ret.clone()));
+                }
+                _ => {}
             }
         }
 
@@ -165,10 +177,27 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn fn_type(&self, params: &[Type], ret: &Type) -> FunctionType<'ctx> {
-        let param_tys: Vec<BasicMetadataTypeEnum> =
-            params.iter().map(|t| self.basic_metadata(t)).collect();
+        self.fn_type_for_decl(params, ret, false)
+    }
+
+    /// `extern_c`: `str` parameters/returns lower to `i8*` (C string).
+    fn fn_type_for_decl(&self, params: &[Type], ret: &Type, extern_c: bool) -> FunctionType<'ctx> {
+        let param_tys: Vec<BasicMetadataTypeEnum> = params
+            .iter()
+            .map(|t| {
+                if extern_c && *t == Type::Str {
+                    self.context.ptr_type(AddressSpace::default()).into()
+                } else {
+                    self.basic_metadata(t)
+                }
+            })
+            .collect();
         match ret {
             Type::Unit => self.context.void_type().fn_type(&param_tys, false),
+            Type::Str if extern_c => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .fn_type(&param_tys, false),
             other => match self.llvm_basic(other) {
                 BasicTypeEnum::IntType(t) => t.fn_type(&param_tys, false),
                 BasicTypeEnum::FloatType(t) => t.fn_type(&param_tys, false),
@@ -1322,22 +1351,41 @@ impl<'ctx> Codegen<'ctx> {
                     .fns
                     .get(callee)
                     .ok_or_else(|| CodegenError::Internal(format!("undef fn {callee}")))?;
-                let (_, fn_ret_ty) = self
+                let (fn_params, fn_ret_ty) = self
                     .fn_types
                     .get(callee)
                     .cloned()
                     .ok_or_else(|| CodegenError::Internal(format!("no sig {callee}")))?;
+                let is_extern = self.externs.contains_key(callee);
                 let mut argv: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
-                for a in args.iter() {
+                let mut owned_strs: Vec<PointerValue<'ctx>> = Vec::new();
+                for (i, a) in args.iter().enumerate() {
                     let v = self.emit_expr(a)?.unwrap();
-                    argv.push(v.into());
+                    if is_extern && fn_params.get(i) == Some(&Type::Str) {
+                        let owned = v.into_pointer_value();
+                        let cstr = self.rt_call_ptr1("risp_str_cstr", owned)?;
+                        argv.push(cstr.into());
+                        owned_strs.push(owned);
+                    } else {
+                        argv.push(v.into());
+                    }
                 }
                 let call = self
                     .builder
                     .build_call(fv, &argv, "calltmp")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                for p in owned_strs {
+                    self.rt_str_release(p)?;
+                }
                 if fn_ret_ty == Type::Unit {
                     Ok(None)
+                } else if is_extern && fn_ret_ty == Type::Str {
+                    let cstr = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| CodegenError::Internal("extern str ret".into()))?
+                        .into_pointer_value();
+                    Ok(Some(self.rt_str_from_cstr(cstr)?.into()))
                 } else {
                     Ok(call.try_as_basic_value().basic())
                 }

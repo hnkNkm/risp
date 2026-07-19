@@ -104,11 +104,62 @@ impl<'a> Parser<'a> {
                 let e = self.parse_enum_body(start)?;
                 Ok(TopLevel::Enum(e))
             }
+            "extern" => {
+                let e = self.parse_extern_body(start)?;
+                Ok(TopLevel::Extern(e))
+            }
             other => Err(ParseError::Unexpected(
                 format!("top-level form {:?}", other),
                 head.span.start,
             )),
         }
+    }
+
+    /// `extern "C" name [params] -> ret)` — LParen + "extern" already consumed
+    fn parse_extern_body(&mut self, start: usize) -> Result<ExternFn, ParseError> {
+        let abi_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let abi = match &abi_tok.tok {
+            Token::Str(s) => s.clone(),
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "ABI string literal (e.g. \"C\")",
+                    found: format!("{:?}", other),
+                    at: abi_tok.span.start,
+                });
+            }
+        };
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        self.eat(&Token::LBracket)?;
+        let mut params = Vec::new();
+        loop {
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::RBracket)) {
+                break;
+            }
+            params.push(self.parse_param()?);
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
+                self.bump();
+            }
+        }
+        self.eat(&Token::RBracket)?;
+        self.eat(&Token::Arrow)?;
+        let ret = self.parse_type()?;
+        let rp = self.eat(&Token::RParen)?;
+        Ok(ExternFn {
+            abi,
+            name,
+            params,
+            ret,
+            span: Span::new(start, rp.span.end),
+        })
     }
 
     /// `struct Name [f: T, ...] )` — LParen + "struct" already consumed
