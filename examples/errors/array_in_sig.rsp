@@ -1,0 +1,8 @@
+; Arrays cannot appear in function signatures yet.
+;;! error_at: 5:12
+;;! error_contains: arrays cannot be used as function parameters
+
+(defn bad [a: (Array i32 3)] -> i32
+  0)
+
+(defn main [] -> i32 0)
