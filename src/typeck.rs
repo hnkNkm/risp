@@ -226,6 +226,13 @@ impl TypeCk {
                 expect(&expected, &vt, val_span)?;
                 Type::Unit
             }
+            ExprKind::While { cond, body } => {
+                let cond_span = cond.span;
+                let ct = self.check_expr(cond, env)?;
+                expect(&Type::Bool, &ct, cond_span)?;
+                let _ = self.check_expr(body, env)?;
+                Type::Unit
+            }
             ExprKind::Call { callee, args } => {
                 let callee = callee.clone();
                 self.check_call(&callee, args, env, span)?

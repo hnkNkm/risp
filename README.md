@@ -69,6 +69,12 @@ ok: f64 cmp
 ;; 可変代入（ローカル / 仮引数のみ。`def` 定数には不可）
 (set! x (+ x 1))
 
+;; ループ
+(while (< i n)
+  (do
+    (set! acc (+ acc i))
+    (set! i (+ i 1))))
+
 ;; 条件分岐
 (if (< x 0) (- x) x)
 
@@ -115,6 +121,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 論理 | `and` `or` `not`（`and` / `or` は短絡評価） |
 | キャスト | `(as T e)`（数値型間） |
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
+| ループ | `(while cond body)`（値は Unit。`break` は未実装） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
 
 ### 評価戦略
@@ -243,7 +250,7 @@ cargo run -- run examples/hello.rsp
 - [ ] 動的String（Rc or GC）
 - [ ] struct / enum
 - [ ] パターンマッチ（match）
-- [ ] while / loop / break
+- [x] while（`break` / `loop` は将来）
 
 ### Phase 4 — 抽象化
 - [ ] trait / impl

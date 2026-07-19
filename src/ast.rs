@@ -123,6 +123,11 @@ pub enum ExprKind {
         name: String,
         value: Box<Expr>,
     },
+    /// `(while cond body)` — loop while cond is true; value is unit
+    While {
+        cond: Box<Expr>,
+        body: Box<Expr>,
+    },
     /// Function call or builtin operator: `(f a b ...)`
     Call {
         callee: String,
