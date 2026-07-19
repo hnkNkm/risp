@@ -1,0 +1,9 @@
+; field access must name a real field.
+;;! error_at: 9:5
+;;! error_contains: unknown field
+
+(struct Point [x: i32, y: i32])
+
+(defn main [] -> i32
+  (let [p: Point (Point 1 2)]
+    (field p z)))

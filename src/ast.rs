@@ -32,6 +32,8 @@ pub enum Type {
     Unit,
     /// Fixed-length array. Values are represented as pointers to stack storage.
     Array { elem: Box<Type>, len: u32 },
+    /// User-defined struct or enum (by name).
+    Named(String),
 }
 
 impl fmt::Display for Type {
@@ -45,6 +47,7 @@ impl fmt::Display for Type {
             Type::Str => f.write_str("str"),
             Type::Unit => f.write_str("unit"),
             Type::Array { elem, len } => write!(f, "(Array {elem} {len})"),
+            Type::Named(n) => f.write_str(n),
         }
     }
 }
@@ -55,6 +58,11 @@ impl Type {
             self,
             Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool
         )
+    }
+
+    /// Fields / enum payloads in MVP ADTs.
+    pub fn is_adt_field_allowed(&self) -> bool {
+        self.is_array_elem_allowed()
     }
 }
 
@@ -70,6 +78,44 @@ pub struct Binding {
     pub name: String,
     pub ty: Type,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantDef {
+    pub name: String,
+    /// `None` = unit variant.
+    pub payload: Option<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<VariantDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub variant: String,
+    /// Binding for payload variants; must be `None` for unit variants.
+    pub binding: Option<String>,
+    pub body: Expr,
     pub span: Span,
 }
 
@@ -103,7 +149,11 @@ pub struct Expr {
 
 impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Self {
-        Self { kind, span, ty: None }
+        Self {
+            kind,
+            span,
+            ty: None,
+        }
     }
 }
 
@@ -144,7 +194,17 @@ pub enum ExprKind {
         elem_ty: Type,
         elems: Vec<Expr>,
     },
-    /// Function call or builtin operator: `(f a b ...)`
+    /// `(field e name)` — struct field access
+    Field {
+        base: Box<Expr>,
+        field: String,
+    },
+    /// `(match e (Variant body) (Variant x body) ...)`
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    /// Function call, builtin, struct construct, or enum variant construct
     Call {
         callee: String,
         args: Vec<Expr>,
@@ -172,6 +232,8 @@ pub struct Const {
 pub enum TopLevel {
     Function(Function),
     Const(Const),
+    Struct(StructDef),
+    Enum(EnumDef),
 }
 
 #[derive(Debug, Clone)]

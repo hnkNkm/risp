@@ -9,3 +9,6 @@ result-*
 /hello
 /cmp_i64
 /cmp_f64
+/adt_smoke
+/enum_opt
+/struct_point

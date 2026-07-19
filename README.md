@@ -41,10 +41,11 @@ ok: f64 cmp
 | `bool` | 真偽値 |
 | `str` | 動的文字列（参照カウント / `runtime/risp_rt.c`） |
 | `(Array T N)` | 固定長配列（要素は数値 / `bool`。ローカルのみ。代入は参照意味論） |
+| 名前付き型 | `struct` / `enum`（フィールド・ペイロードは数値 / `bool` のみ） |
 
 ### メモリ管理
 
-- 数値・`bool`・固定長配列は値 / スタック
+- 数値・`bool`・固定長配列・`struct` / `enum` は値 / スタック
 - **`str` は参照カウント**（C ランタイム `risp_str_*`）。GC ではなく Rc 方針（将来の所有権検査へ寄せやすい）
 - 借用チェッカ（Rust的所有権）は未導入（Phase 5）
 
@@ -80,6 +81,19 @@ ok: f64 cmp
   (do
     (aset! a 0 10)
     (+ (aget a 0) (alen a))))
+
+;; 構造体
+(struct Point [x: i32, y: i32])
+(let [p: Point (Point 3 4)]
+  (+ (field p x) (field p y)))
+
+;; 列挙型 + パターンマッチ（網羅必須。unit / 単一ペイロード）
+(enum Opt
+  None
+  Some i32)
+(match o
+  (None 0)
+  (Some n n))
 
 ;; 条件分岐
 (if (< x 0) (- x) x)
@@ -129,6 +143,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
 | ループ | `(while cond body)`（値は Unit。`break` は未実装） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
+| ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
 
@@ -256,8 +271,8 @@ cargo run -- run examples/hello.rsp
 
 ### Phase 3 — 言語機能
 - [x] 動的 String（Rc ランタイム）
-- [ ] struct / enum
-- [ ] パターンマッチ（match）
+- [x] struct / enum（フィールド・ペイロードはプリミティブのみ）
+- [x] パターンマッチ（match：unit / 単一ペイロード、網羅必須）
 - [x] while（`break` / `loop` は将来）
 
 ### Phase 4 — 抽象化

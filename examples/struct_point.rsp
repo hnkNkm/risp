@@ -1,0 +1,14 @@
+; struct construct + field access; pass struct to a function.
+;;! stdout: ok: struct
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(defn sum-point [p: Point] -> i32
+  (+ (field p x) (field p y)))
+
+(defn main [] -> i32
+  (let [p: Point (Point 3 4)]
+    (if (= (sum-point p) 7)
+      (do (println "ok: struct") 0)
+      (do (println "FAIL: struct") 1))))

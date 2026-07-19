@@ -1,0 +1,11 @@
+; match must cover every variant.
+;;! error_at: 10:3
+;;! error_contains: match is not exhaustive
+
+(enum Opt
+  None
+  Some i32)
+
+(defn main [] -> i32
+  (match (None)
+    (None 0)))
