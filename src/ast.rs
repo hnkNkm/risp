@@ -21,7 +21,7 @@ impl Span {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     I32,
     I64,
@@ -243,6 +243,32 @@ pub struct ExternFn {
     pub span: Span,
 }
 
+/// Trait method signature (no body). First param may be bare `self` (type filled later).
+#[derive(Debug, Clone)]
+pub struct MethodSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitDef {
+    pub name: String,
+    pub methods: Vec<MethodSig>,
+    pub span: Span,
+}
+
+/// `impl Trait for T` block. Methods reuse `Function` (name is the method name;
+/// codegen uses a mangled LLVM symbol).
+#[derive(Debug, Clone)]
+pub struct ImplBlock {
+    pub trait_name: String,
+    pub for_ty: Type,
+    pub methods: Vec<Function>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum TopLevel {
     Function(Function),
@@ -250,6 +276,8 @@ pub enum TopLevel {
     Struct(StructDef),
     Enum(EnumDef),
     Extern(ExternFn),
+    Trait(TraitDef),
+    Impl(ImplBlock),
 }
 
 #[derive(Debug, Clone)]

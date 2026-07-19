@@ -108,10 +108,177 @@ impl<'a> Parser<'a> {
                 let e = self.parse_extern_body(start)?;
                 Ok(TopLevel::Extern(e))
             }
+            "trait" => {
+                let t = self.parse_trait_body(start)?;
+                Ok(TopLevel::Trait(t))
+            }
+            "impl" => {
+                let i = self.parse_impl_body(start)?;
+                Ok(TopLevel::Impl(i))
+            }
             other => Err(ParseError::Unexpected(
                 format!("top-level form {:?}", other),
                 head.span.start,
             )),
+        }
+    }
+
+    /// `trait Name (method [params] -> ret)* )` — LParen + "trait" already consumed
+    fn parse_trait_body(&mut self, start: usize) -> Result<TraitDef, ParseError> {
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        let mut methods = Vec::new();
+        while !matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+            methods.push(self.parse_method_sig()?);
+        }
+        let rp = self.eat(&Token::RParen)?;
+        Ok(TraitDef {
+            name,
+            methods,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    /// `(name [params] -> ret)` — method signature without body
+    fn parse_method_sig(&mut self) -> Result<MethodSig, ParseError> {
+        let lp = self.eat(&Token::LParen)?;
+        let start = lp.span.start;
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        let params = self.parse_method_params()?;
+        self.eat(&Token::Arrow)?;
+        let ret = self.parse_type()?;
+        let rp = self.eat(&Token::RParen)?;
+        Ok(MethodSig {
+            name,
+            params,
+            ret,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    /// `impl Trait for Type (method [params] -> ret body)* )` — LParen + "impl" consumed
+    fn parse_impl_body(&mut self, start: usize) -> Result<ImplBlock, ParseError> {
+        let trait_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let trait_name = match &trait_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    trait_tok.span.start,
+                ));
+            }
+        };
+        let for_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        match &for_tok.tok {
+            Token::Ident(s) if s == "for" => {}
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "'for'",
+                    found: format!("{:?}", other),
+                    at: for_tok.span.start,
+                });
+            }
+        }
+        let for_ty = self.parse_type()?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek().map(|s| &s.tok), Some(Token::RParen)) {
+            methods.push(self.parse_method_impl()?);
+        }
+        let rp = self.eat(&Token::RParen)?;
+        Ok(ImplBlock {
+            trait_name,
+            for_ty,
+            methods,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    /// `(name [params] -> ret body)` — method with body inside an impl
+    fn parse_method_impl(&mut self) -> Result<Function, ParseError> {
+        let lp = self.eat(&Token::LParen)?;
+        let start = lp.span.start;
+        let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+        let name = match &name_tok.tok {
+            Token::Ident(s) => s.clone(),
+            other => {
+                return Err(ParseError::Unexpected(
+                    format!("{:?}", other),
+                    name_tok.span.start,
+                ));
+            }
+        };
+        let params = self.parse_method_params()?;
+        self.eat(&Token::Arrow)?;
+        let ret = self.parse_type()?;
+        let body = self.parse_expr()?;
+        let rp = self.eat(&Token::RParen)?;
+        Ok(Function {
+            name,
+            params,
+            ret,
+            body,
+            span: Span::new(start, rp.span.end),
+        })
+    }
+
+    /// Parameter list for trait/impl methods. First param may be bare `self`.
+    fn parse_method_params(&mut self) -> Result<Vec<Param>, ParseError> {
+        self.eat(&Token::LBracket)?;
+        let mut params = Vec::new();
+        let mut first = true;
+        loop {
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::RBracket)) {
+                break;
+            }
+            if first && self.peek_bare_self() {
+                let name_tok = self.bump().unwrap();
+                let start = name_tok.span.start;
+                let end = name_tok.span.end;
+                // Placeholder type; typeck fills from `impl … for T`.
+                params.push(Param {
+                    name: "self".into(),
+                    ty: Type::Unit,
+                    span: Span::new(start, end),
+                });
+            } else {
+                params.push(self.parse_param()?);
+            }
+            first = false;
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
+                self.bump();
+            }
+        }
+        self.eat(&Token::RBracket)?;
+        Ok(params)
+    }
+
+    /// `self` not followed by `:` (bare self receiver).
+    fn peek_bare_self(&self) -> bool {
+        match self.peek().map(|s| &s.tok) {
+            Some(Token::Ident(s)) if s == "self" => {
+                matches!(
+                    self.toks.get(self.pos + 1).map(|s| &s.tok),
+                    Some(Token::RBracket) | Some(Token::Comma) | None
+                )
+            }
+            _ => false,
         }
     }
 
@@ -800,5 +967,37 @@ mod tests {
         let src = "(defn f [n: i32] -> i32 (let [x: i32 (+ n 1)] (if (< x 0) 0 x)))";
         let prog = parse(src).unwrap();
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn parse_trait_impl() {
+        let src = r#"
+        (trait Show
+          (show [self] -> str))
+        (impl Show for i32
+          (show [self] -> str
+            "i32"))
+        (defn main [] -> i32
+          (do (println (show 1)) 0))
+        "#;
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.items.len(), 3);
+        match &prog.items[0] {
+            TopLevel::Trait(t) => {
+                assert_eq!(t.name, "Show");
+                assert_eq!(t.methods.len(), 1);
+                assert_eq!(t.methods[0].name, "show");
+                assert_eq!(t.methods[0].params[0].name, "self");
+            }
+            other => panic!("expected Trait, got {other:?}"),
+        }
+        match &prog.items[1] {
+            TopLevel::Impl(i) => {
+                assert_eq!(i.trait_name, "Show");
+                assert_eq!(i.for_ty, Type::I32);
+                assert_eq!(i.methods[0].name, "show");
+            }
+            other => panic!("expected Impl, got {other:?}"),
+        }
     }
 }
