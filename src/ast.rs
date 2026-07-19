@@ -281,6 +281,16 @@ pub struct ImplBlock {
     pub span: Span,
 }
 
+/// Syntactic macro: `(defmacro name [params] template)`.
+/// Expanded before type checking; not present in the program after macroexpand.
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub template: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum TopLevel {
     Function(Function),
@@ -291,6 +301,7 @@ pub enum TopLevel {
     Extern(ExternFn),
     Trait(TraitDef),
     Impl(ImplBlock),
+    DefMacro(MacroDef),
 }
 
 #[derive(Debug, Clone)]
