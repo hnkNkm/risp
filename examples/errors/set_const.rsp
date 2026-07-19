@@ -1,0 +1,10 @@
+; Cannot set! a top-level def.
+;;! error_at: 9:5
+;;! error_contains: cannot assign to constant
+
+(def PI: f64 3.14)
+
+(defn main [] -> i32
+  (do
+    (set! PI 1.0)
+    0))

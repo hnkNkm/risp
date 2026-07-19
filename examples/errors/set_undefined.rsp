@@ -1,0 +1,8 @@
+; set! on undefined name.
+;;! error_at: 7:5
+;;! error_contains: undefined variable
+
+(defn main [] -> i32
+  (do
+    (set! missing 1)
+    0))
