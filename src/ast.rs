@@ -118,6 +118,11 @@ pub enum ExprKind {
         ty: Type,
         expr: Box<Expr>,
     },
+    /// `(set! name value)` — assign to a local / parameter
+    Set {
+        name: String,
+        value: Box<Expr>,
+    },
     /// Function call or builtin operator: `(f a b ...)`
     Call {
         callee: String,

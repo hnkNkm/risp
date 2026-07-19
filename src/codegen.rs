@@ -412,6 +412,20 @@ impl<'ctx> Codegen<'ctx> {
                     .ok_or_else(|| CodegenError::Internal("cast expr".into()))?;
                 Ok(Some(self.emit_cast(v, &from_ty, to_ty)?))
             }
+            ExprKind::Set { name, value } => {
+                let v = self
+                    .emit_expr(value)?
+                    .ok_or_else(|| CodegenError::Internal("set! value".into()))?;
+                let (ptr, _) = self
+                    .locals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| CodegenError::Internal(format!("set! unresolved {name}")))?;
+                self.builder
+                    .build_store(ptr, v)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                Ok(None)
+            }
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
     }

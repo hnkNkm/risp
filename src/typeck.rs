@@ -24,6 +24,8 @@ pub enum TypeError {
     Duplicate(String, Span),
     #[error("const initializer must be a literal")]
     ConstNotLiteral(Span),
+    #[error("cannot assign to constant {0:?}")]
+    AssignConst(String, Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -40,7 +42,8 @@ impl TypeError {
             | TypeError::IntLitOverflow(_, s)
             | TypeError::BadCast { span: s, .. }
             | TypeError::Duplicate(_, s)
-            | TypeError::ConstNotLiteral(s) => Some(*s),
+            | TypeError::ConstNotLiteral(s)
+            | TypeError::AssignConst(_, s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
@@ -209,6 +212,19 @@ impl TypeCk {
                     return Err(TypeError::BadCast { from, to, span });
                 }
                 to
+            }
+            ExprKind::Set { name, value } => {
+                let expected = if let Some(t) = env.get(name) {
+                    t.clone()
+                } else if self.consts.contains_key(name) {
+                    return Err(TypeError::AssignConst(name.clone(), span));
+                } else {
+                    return Err(TypeError::UndefinedVar(name.clone(), span));
+                };
+                let val_span = value.span;
+                let vt = self.check_expr(value, env)?;
+                expect(&expected, &vt, val_span)?;
+                Type::Unit
             }
             ExprKind::Call { callee, args } => {
                 let callee = callee.clone();

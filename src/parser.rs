@@ -311,6 +311,28 @@ impl<'a> Parser<'a> {
                     Span::new(start, rp.span.end),
                 ))
             }
+            Some("set!") => {
+                self.bump();
+                let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
+                let name = match &name_tok.tok {
+                    Token::Ident(s) => s.clone(),
+                    other => {
+                        return Err(ParseError::Unexpected(
+                            format!("{:?}", other),
+                            name_tok.span.start,
+                        ));
+                    }
+                };
+                let value = self.parse_expr()?;
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Set {
+                        name,
+                        value: Box::new(value),
+                    },
+                    Span::new(start, rp.span.end),
+                ))
+            }
             Some(_) | None => {
                 // generic call: callee must be ident
                 let callee_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;

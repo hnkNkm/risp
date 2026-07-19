@@ -1,0 +1,15 @@
+; Mutable locals via set!.
+;;! stdout: ok: set!
+;;! exit: 0
+
+(defn bump [n: i32] -> i32
+  (let [i: i32 n]
+    (do
+      (set! i (+ i 1))
+      (set! i (+ i 1))
+      i)))
+
+(defn main [] -> i32
+  (if (= (bump 40) 42)
+    (do (println "ok: set!") 0)
+    (do (println "FAIL: set!") 1)))
