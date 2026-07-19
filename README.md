@@ -105,12 +105,12 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 |---|---|
 | 算術 | `+` `-` `*` `/` `mod` |
 | 比較 | `<` `<=` `>` `>=` `=` `!=` |
-| 論理 | `and` `or` `not` |
+| 論理 | `and` `or` `not`（`and` / `or` は短絡評価） |
 | I/O | `print` `println`（MVPは `str` のみ） |
 
 ### 評価戦略
 
-正格評価（applicative order）。
+正格評価（applicative order）。ただし `and` / `or` は短絡する（左が決まれば右を評価しない）。
 
 ## コンパイラパイプライン
 

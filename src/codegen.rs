@@ -268,18 +268,8 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.emit_cmp(callee, a, b)?;
                 Ok(Some(v.into()))
             }
-            "and" => {
-                let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
-                let b = self.emit_expr(&args[1])?.unwrap().into_int_value();
-                let v = self.builder.build_and(a, b, "andtmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                Ok(Some(v.into()))
-            }
-            "or" => {
-                let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
-                let b = self.emit_expr(&args[1])?.unwrap().into_int_value();
-                let v = self.builder.build_or(a, b, "ortmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
-                Ok(Some(v.into()))
-            }
+            "and" => Ok(Some(self.emit_short_circuit_and(args)?.into())),
+            "or" => Ok(Some(self.emit_short_circuit_or(args)?.into())),
             "not" => {
                 let a = self.emit_expr(&args[0])?.unwrap().into_int_value();
                 let v = self.builder.build_not(a, "nottmp").map_err(|e| CodegenError::Llvm(e.to_string()))?;
@@ -330,6 +320,84 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
+    }
+
+    /// `(and a b)` — evaluate `b` only when `a` is true.
+    fn emit_short_circuit_and(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let bool_ty = self.context.bool_type();
+        let a = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("and lhs".into()))?
+            .into_int_value();
+        let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let rhs_bb = self.context.append_basic_block(fv, "and.rhs");
+        let merge_bb = self.context.append_basic_block(fv, "and.end");
+        let entry_bb = self.builder.get_insert_block().unwrap();
+
+        self.builder
+            .build_conditional_branch(a, rhs_bb, merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(rhs_bb);
+        let b = self
+            .emit_expr(&args[1])?
+            .ok_or_else(|| CodegenError::Internal("and rhs".into()))?
+            .into_int_value();
+        let rhs_end = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(bool_ty, "andtmp")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let false_v = bool_ty.const_int(0, false);
+        phi.add_incoming(&[(&false_v, entry_bb), (&b, rhs_end)]);
+        Ok(phi.as_basic_value().into_int_value())
+    }
+
+    /// `(or a b)` — evaluate `b` only when `a` is false.
+    fn emit_short_circuit_or(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let bool_ty = self.context.bool_type();
+        let a = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("or lhs".into()))?
+            .into_int_value();
+        let fv = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let rhs_bb = self.context.append_basic_block(fv, "or.rhs");
+        let merge_bb = self.context.append_basic_block(fv, "or.end");
+        let entry_bb = self.builder.get_insert_block().unwrap();
+
+        self.builder
+            .build_conditional_branch(a, merge_bb, rhs_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(rhs_bb);
+        let b = self
+            .emit_expr(&args[1])?
+            .ok_or_else(|| CodegenError::Internal("or rhs".into()))?
+            .into_int_value();
+        let rhs_end = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(bool_ty, "ortmp")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let true_v = bool_ty.const_int(1, false);
+        phi.add_incoming(&[(&true_v, entry_bb), (&b, rhs_end)]);
+        Ok(phi.as_basic_value().into_int_value())
     }
 
     fn emit_arith(
