@@ -1,0 +1,8 @@
+; Only ABI "C" is supported.
+;;! error_at: 5:1
+;;! error_contains: unsupported extern ABI
+
+(extern "stdcall" abs [x: i32] -> i32)
+
+(defn main [] -> i32
+  0)

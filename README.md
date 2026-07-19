@@ -147,6 +147,7 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | ループ | `(while cond body)` / `(loop body)` / `(break)`（値は Unit） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
 | ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)` |
+| FFI | `(extern "C" name [params] -> ret)`（プリミティブ / `str`。`str` は C 文字列に変換） |
 | 文字列 | `str-concat` / `str-len`（`str` は Rc） |
 | I/O | `print` `println`（`str` / 整数 / 浮動小数 / `bool`） |
 
@@ -276,7 +277,7 @@ cargo run -- run examples/hello.rsp
 - [x] 動的 String（Rc ランタイム）
 - [x] struct / enum（フィールド・ペイロードはプリミティブのみ）
 - [x] パターンマッチ（match：unit / 単一ペイロード、網羅必須）
-- [x] while（`break` / `loop` は将来）
+- [x] while / loop / break
 
 ### Phase 4 — 抽象化
 - [ ] trait / impl
@@ -286,7 +287,7 @@ cargo run -- run examples/hello.rsp
 
 ### Phase 5 — Nice to have
 - [ ] 所有権・借用検査
-- [ ] FFI（Cライブラリ呼び出し）
+- [x] FFI（`(extern "C" …)`）
 - [ ] モジュールシステム
 
 ## ライセンス

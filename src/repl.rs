@@ -94,7 +94,7 @@ fn print_help() {
          ;   :quit / :q     exit\n\
          ;   :clear         drop accumulated definitions\n\
          ;   :defs          show accumulated definitions\n\
-         ; Definitions (`defn` / `def` / `struct` / `enum`) persist across inputs.\n\
+         ; Definitions (`defn` / `def` / `struct` / `enum` / `extern`) persist across inputs.\n\
          ; Other expressions are JIT-evaluated and printed."
     );
 }
@@ -179,6 +179,7 @@ fn is_definition(src: &str) -> bool {
         || t.starts_with("(def\n")
         || t.starts_with("(struct")
         || t.starts_with("(enum")
+        || t.starts_with("(extern")
 }
 
 /// Net open paren/bracket count. Ignores contents of string literals.
