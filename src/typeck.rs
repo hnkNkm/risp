@@ -87,6 +87,8 @@ pub enum TypeError {
     UndefinedTrait(String, Span),
     #[error("trait method call requires at least one argument (receiver)")]
     TraitCallNoReceiver(Span),
+    #[error("cannot infer type parameter {0:?}")]
+    InferTypeParam(String, Span),
     #[error("missing main function")]
     NoMain,
 }
@@ -128,21 +130,31 @@ impl TypeError {
             | TypeError::MethodNotInTrait(_, _, s)
             | TypeError::AmbiguousTraitMethod(_, s)
             | TypeError::UndefinedTrait(_, s)
-            | TypeError::TraitCallNoReceiver(s) => Some(*s),
+            | TypeError::TraitCallNoReceiver(s)
+            | TypeError::InferTypeParam(_, s) => Some(*s),
             TypeError::NoMain => None,
         }
     }
 }
 
+fn sanitize_ident_part(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 /// Mangle an impl method to a unique LLVM / fn-table name.
 /// Type display is sanitized: non-alphanumeric chars become `_`.
 pub fn mangle_method(trait_name: &str, ty: &Type, method: &str) -> String {
-    let ty_s: String = ty
-        .to_string()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    let ty_s = sanitize_ident_part(&ty.to_string());
     format!("__risp_{trait_name}_{ty_s}_{method}")
+}
+
+/// Mangle a monomorphized generic function.
+pub fn mangle_mono(name: &str, tys: &[Type]) -> String {
+    let name_s = sanitize_ident_part(name);
+    let ty_parts: Vec<String> = tys.iter().map(|t| sanitize_ident_part(&t.to_string())).collect();
+    format!("__risp_mono_{name_s}_{}", ty_parts.join("_"))
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +185,12 @@ pub struct TypeCk {
     pub trait_methods: HashMap<String, String>,
     /// (trait_name, for_ty) that have an impl
     pub impls: HashSet<(String, Type)>,
+    /// Generic function templates (not in `fns` until monomorphized).
+    generic_fns: HashMap<String, GenericFunction>,
+    /// Already-emitted monomorphizations: (generic name, type args) -> mangled name.
+    mono_cache: HashMap<(String, Vec<Type>), String>,
+    /// Concrete functions produced by monomorphization (appended to Program).
+    mono_fns: Vec<Function>,
     /// Nesting depth of `while` / `loop` while checking expressions.
     loop_depth: usize,
 }
@@ -189,6 +207,9 @@ impl TypeCk {
             traits: HashMap::new(),
             trait_methods: HashMap::new(),
             impls: HashSet::new(),
+            generic_fns: HashMap::new(),
+            mono_cache: HashMap::new(),
+            mono_fns: Vec::new(),
             loop_depth: 0,
         }
     }
@@ -216,6 +237,9 @@ impl TypeCk {
         self.traits.clear();
         self.trait_methods.clear();
         self.impls.clear();
+        self.generic_fns.clear();
+        self.mono_cache.clear();
+        self.mono_fns.clear();
 
         // Collect type definitions first.
         for it in &prog.items {
@@ -308,7 +332,7 @@ impl TypeCk {
             }
         }
 
-        // Collect function / const signatures.
+        // Collect function / generic / const signatures.
         for it in &prog.items {
             match it {
                 TopLevel::Function(f) => {
@@ -328,6 +352,31 @@ impl TypeCk {
                         ret: f.ret.clone(),
                     };
                     self.fns.insert(f.name.clone(), sig);
+                }
+                TopLevel::GenericFunction(g) => {
+                    self.register_name(&g.name, g.span)?;
+                    let mut tp_names: HashSet<String> = HashSet::new();
+                    for (name, bound) in &g.type_params {
+                        if !tp_names.insert(name.clone()) {
+                            return Err(TypeError::Duplicate(name.clone(), g.span));
+                        }
+                        if let Some(trait_name) = bound {
+                            if !self.traits.contains_key(trait_name) {
+                                return Err(TypeError::UndefinedTrait(trait_name.clone(), g.span));
+                            }
+                        }
+                    }
+                    for p in &g.params {
+                        self.resolve_type_with_params(&p.ty, p.span, &tp_names)?;
+                        if matches!(p.ty, Type::Array { .. }) {
+                            return Err(TypeError::ArrayInSignature(p.span));
+                        }
+                    }
+                    self.resolve_type_with_params(&g.ret, g.span, &tp_names)?;
+                    if matches!(g.ret, Type::Array { .. }) {
+                        return Err(TypeError::ArrayInSignature(g.span));
+                    }
+                    self.generic_fns.insert(g.name.clone(), g.clone());
                 }
                 TopLevel::Extern(e) => {
                     if e.abi != "C" {
@@ -507,8 +556,14 @@ impl TypeCk {
                 TopLevel::Struct(_)
                 | TopLevel::Enum(_)
                 | TopLevel::Extern(_)
-                | TopLevel::Trait(_) => {}
+                | TopLevel::Trait(_)
+                | TopLevel::GenericFunction(_) => {}
             }
+        }
+
+        // Emit monomorphized functions so codegen sees them as normal Functions.
+        for f in self.mono_fns.drain(..) {
+            prog.items.push(TopLevel::Function(f));
         }
         Ok(())
     }
@@ -522,6 +577,7 @@ impl TypeCk {
             || self.externs.contains_key(name)
             || self.traits.contains_key(name)
             || self.trait_methods.contains_key(name)
+            || self.generic_fns.contains_key(name)
         {
             return Err(TypeError::Duplicate(name.to_string(), span));
         }
@@ -538,6 +594,26 @@ impl TypeCk {
                 }
             }
             Type::Array { elem, .. } => self.resolve_type(elem, span),
+            _ => Ok(()),
+        }
+    }
+
+    fn resolve_type_with_params(
+        &self,
+        ty: &Type,
+        span: Span,
+        type_params: &HashSet<String>,
+    ) -> Result<(), TypeError> {
+        match ty {
+            Type::Named(n) if type_params.contains(n) => Ok(()),
+            Type::Named(n) => {
+                if self.structs.contains_key(n) || self.enums.contains_key(n) {
+                    Ok(())
+                } else {
+                    Err(TypeError::UndefinedType(n.clone(), span))
+                }
+            }
+            Type::Array { elem, .. } => self.resolve_type_with_params(elem, span, type_params),
             _ => Ok(()),
         }
     }
@@ -1111,6 +1187,9 @@ impl TypeCk {
                 Ok(Type::I32)
             }
             _ => {
+                if self.generic_fns.contains_key(callee.as_str()) {
+                    return self.check_generic_call(callee, args, env, call_span);
+                }
                 let sig = self
                     .fns
                     .get(callee.as_str())
@@ -1132,6 +1211,217 @@ impl TypeCk {
                 Ok(sig.ret.clone())
             }
         }
+    }
+
+    fn check_generic_call(
+        &mut self,
+        callee: &mut String,
+        args: &mut [Expr],
+        env: &mut HashMap<String, Type>,
+        call_span: Span,
+    ) -> Result<Type, TypeError> {
+        let g = self.generic_fns[callee.as_str()].clone();
+        if g.params.len() != args.len() {
+            return Err(TypeError::Arity {
+                name: callee.clone(),
+                expected: g.params.len(),
+                got: args.len(),
+                span: call_span,
+            });
+        }
+
+        let tp_names: HashSet<String> = g.type_params.iter().map(|(n, _)| n.clone()).collect();
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut arg_tys = Vec::with_capacity(args.len());
+        for (param, arg) in g.params.iter().zip(args.iter_mut()) {
+            let s = arg.span;
+            let at = self.check_expr(arg, env)?;
+            unify_type_param(&param.ty, &at, &tp_names, &mut subst, s)?;
+            arg_tys.push(at);
+        }
+
+        let mut type_args = Vec::with_capacity(g.type_params.len());
+        for (name, bound) in &g.type_params {
+            let Some(ty) = subst.get(name).cloned() else {
+                return Err(TypeError::InferTypeParam(name.clone(), call_span));
+            };
+            if let Some(trait_name) = bound {
+                if !self.impls.contains(&(trait_name.clone(), ty.clone())) {
+                    return Err(TypeError::MissingImpl {
+                        trait_name: trait_name.clone(),
+                        ty,
+                        span: call_span,
+                    });
+                }
+            }
+            type_args.push(ty);
+        }
+
+        let mangled = self.instantiate_generic(&g, &type_args, &subst)?;
+        let sig = self.fns[&mangled].clone();
+        for (param_ty, (arg, at)) in sig
+            .params
+            .iter()
+            .zip(args.iter().zip(arg_tys.iter()))
+        {
+            expect(param_ty, at, arg.span)?;
+        }
+        *callee = mangled;
+        Ok(sig.ret)
+    }
+
+    /// Clone a generic template with `subst`, type-check the body, and cache it.
+    fn instantiate_generic(
+        &mut self,
+        g: &GenericFunction,
+        type_args: &[Type],
+        subst: &HashMap<String, Type>,
+    ) -> Result<String, TypeError> {
+        let key = (g.name.clone(), type_args.to_vec());
+        if let Some(mangled) = self.mono_cache.get(&key) {
+            return Ok(mangled.clone());
+        }
+
+        let mangled = mangle_mono(&g.name, type_args);
+        let params: Vec<Param> = g
+            .params
+            .iter()
+            .map(|p| Param {
+                name: p.name.clone(),
+                ty: subst_type(&p.ty, subst),
+                span: p.span,
+            })
+            .collect();
+        let ret = subst_type(&g.ret, subst);
+        let mut body = g.body.clone();
+        subst_expr(&mut body, subst);
+
+        // Register signature before checking body (allows recursion / mutual calls).
+        let sig = FnSig {
+            params: params.iter().map(|p| p.ty.clone()).collect(),
+            ret: ret.clone(),
+        };
+        self.fns.insert(mangled.clone(), sig);
+        self.mono_cache.insert(key, mangled.clone());
+
+        let mut env: HashMap<String, Type> = HashMap::new();
+        for p in &params {
+            env.insert(p.name.clone(), p.ty.clone());
+        }
+        let body_span = body.span;
+        let body_ty = self.check_expr(&mut body, &mut env)?;
+        expect(&ret, &body_ty, body_span)?;
+
+        self.mono_fns.push(Function {
+            name: mangled.clone(),
+            params,
+            ret,
+            body,
+            span: g.span,
+        });
+        Ok(mangled)
+    }
+}
+
+fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Named(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array { elem, len } => Type::Array {
+            elem: Box::new(subst_type(elem, subst)),
+            len: *len,
+        },
+        other => other.clone(),
+    }
+}
+
+fn subst_expr(e: &mut Expr, subst: &HashMap<String, Type>) {
+    match &mut e.kind {
+        ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Break => {}
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            subst_expr(cond, subst);
+            subst_expr(then_branch, subst);
+            subst_expr(else_branch, subst);
+        }
+        ExprKind::Let { bindings, body } => {
+            for b in bindings.iter_mut() {
+                b.ty = subst_type(&b.ty, subst);
+                subst_expr(&mut b.value, subst);
+            }
+            subst_expr(body, subst);
+        }
+        ExprKind::Do(es) => {
+            for ex in es.iter_mut() {
+                subst_expr(ex, subst);
+            }
+        }
+        ExprKind::Cast { ty, expr } => {
+            *ty = subst_type(ty, subst);
+            subst_expr(expr, subst);
+        }
+        ExprKind::Set { value, .. } => subst_expr(value, subst),
+        ExprKind::While { cond, body } => {
+            subst_expr(cond, subst);
+            subst_expr(body, subst);
+        }
+        ExprKind::Loop { body } => subst_expr(body, subst),
+        ExprKind::ArrayLit { elem_ty, elems } => {
+            *elem_ty = subst_type(elem_ty, subst);
+            for el in elems.iter_mut() {
+                subst_expr(el, subst);
+            }
+        }
+        ExprKind::Field { base, .. } => subst_expr(base, subst),
+        ExprKind::Match { scrutinee, arms } => {
+            subst_expr(scrutinee, subst);
+            for arm in arms.iter_mut() {
+                subst_expr(&mut arm.body, subst);
+            }
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args.iter_mut() {
+                subst_expr(a, subst);
+            }
+        }
+    }
+    e.ty = None;
+}
+
+/// Unify a (possibly generic) parameter type against a concrete argument type.
+fn unify_type_param(
+    pattern: &Type,
+    concrete: &Type,
+    type_params: &HashSet<String>,
+    subst: &mut HashMap<String, Type>,
+    span: Span,
+) -> Result<(), TypeError> {
+    match pattern {
+        Type::Named(n) if type_params.contains(n) => {
+            if let Some(prev) = subst.get(n) {
+                expect(prev, concrete, span)
+            } else {
+                subst.insert(n.clone(), concrete.clone());
+                Ok(())
+            }
+        }
+        Type::Array {
+            elem: pe,
+            len: plen,
+        } => match concrete {
+            Type::Array {
+                elem: ce,
+                len: clen,
+            } if plen == clen => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        _ => expect(pattern, concrete, span),
     }
 }
 

@@ -88,10 +88,7 @@ impl<'a> Parser<'a> {
             }
         };
         match head_name.as_str() {
-            "defn" => {
-                let f = self.parse_defn_body(start)?;
-                Ok(TopLevel::Function(f))
-            }
+            "defn" => self.parse_defn_body(start),
             "def" => {
                 let c = self.parse_def_body(start)?;
                 Ok(TopLevel::Const(c))
@@ -453,16 +450,38 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `defn name [params] -> ret body)`  -- LParen + "defn" already consumed
-    fn parse_defn_body(&mut self, start: usize) -> Result<Function, ParseError> {
+    /// `defn name [params] -> ret body)` or
+    /// `defn name [T ...] [params] -> ret body)` — LParen + "defn" already consumed.
+    ///
+    /// Type params use a dedicated first `[]` when a second `[]` follows:
+    /// `(defn id [T] [x: T] -> T x)`, `(defn f [T: Show] [x: T] -> unit ...)`.
+    /// A single `[]` is always value params: `(defn add [x: i32] -> i32 ...)`.
+    fn parse_defn_body(&mut self, start: usize) -> Result<TopLevel, ParseError> {
         let name_tok = self.bump().ok_or(ParseError::UnexpectedEof)?;
         let name = match &name_tok.tok {
             Token::Ident(s) => s.clone(),
             other => return Err(ParseError::Unexpected(format!("{:?}", other), name_tok.span.start)),
         };
 
-        // parameter list `[ ... ]`
         self.eat(&Token::LBracket)?;
+        let checkpoint = self.pos;
+        let type_params = if let Some(tps) = self.try_parse_type_param_list() {
+            self.eat(&Token::RBracket)?;
+            if matches!(self.peek().map(|s| &s.tok), Some(Token::LBracket)) {
+                Some(tps)
+            } else {
+                // Ambiguous shape (e.g. `[x: i32]`) but no second `[` — value params.
+                self.pos = checkpoint;
+                None
+            }
+        } else {
+            self.pos = checkpoint;
+            None
+        };
+
+        if type_params.is_some() {
+            self.eat(&Token::LBracket)?;
+        }
         let mut params = Vec::new();
         loop {
             if matches!(self.peek().map(|s| &s.tok), Some(Token::RBracket)) {
@@ -470,28 +489,83 @@ impl<'a> Parser<'a> {
             }
             let p = self.parse_param()?;
             params.push(p);
-            // optional comma
             if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
                 self.bump();
             }
         }
         self.eat(&Token::RBracket)?;
 
-        // -> ret_ty
         self.eat(&Token::Arrow)?;
         let ret = self.parse_type()?;
-
-        // body
         let body = self.parse_expr()?;
-
         let rp = self.eat(&Token::RParen)?;
-        Ok(Function {
-            name,
-            params,
-            ret,
-            body,
-            span: Span::new(start, rp.span.end),
-        })
+        let span = Span::new(start, rp.span.end);
+
+        match type_params {
+            Some(type_params) if !type_params.is_empty() => {
+                Ok(TopLevel::GenericFunction(GenericFunction {
+                    name,
+                    type_params,
+                    params,
+                    ret,
+                    body,
+                    span,
+                }))
+            }
+            _ => Ok(TopLevel::Function(Function {
+                name,
+                params,
+                ret,
+                body,
+                span,
+            })),
+        }
+    }
+
+    /// Parse `Name` or `Name: TraitName` entries until `]`. Does not consume `]`.
+    /// Returns `None` (and restores position) if the list is not type-param shaped.
+    fn try_parse_type_param_list(&mut self) -> Option<Vec<(String, Option<String>)>> {
+        let checkpoint = self.pos;
+        let mut params = Vec::new();
+        loop {
+            match self.peek().map(|s| &s.tok) {
+                Some(Token::RBracket) => break,
+                Some(Token::Ident(_)) => {
+                    let name_tok = self.bump().unwrap();
+                    let name = match &name_tok.tok {
+                        Token::Ident(s) => s.clone(),
+                        _ => unreachable!(),
+                    };
+                    let bound = if matches!(self.peek().map(|s| &s.tok), Some(Token::Colon)) {
+                        self.bump();
+                        match self.peek().map(|s| &s.tok) {
+                            Some(Token::Ident(_)) => {
+                                let t = self.bump().unwrap();
+                                match &t.tok {
+                                    Token::Ident(s) => Some(s.clone()),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            _ => {
+                                self.pos = checkpoint;
+                                return None;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    params.push((name, bound));
+                    if matches!(self.peek().map(|s| &s.tok), Some(Token::Comma)) {
+                        self.bump();
+                    }
+                }
+                _ => {
+                    self.pos = checkpoint;
+                    return None;
+                }
+            }
+        }
+        Some(params)
     }
 
     /// `def name: ty value)` -- LParen + "def" already consumed
@@ -998,6 +1072,38 @@ mod tests {
                 assert_eq!(i.methods[0].name, "show");
             }
             other => panic!("expected Impl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generic_defn() {
+        let src = r#"
+        (defn id [T] [x: T] -> T x)
+        (defn print-show [T: Show] [x: T] -> unit (println (show x)))
+        (defn add [x: i32, y: i32] -> i32 (+ x y))
+        "#;
+        let prog = parse(src).unwrap();
+        assert_eq!(prog.items.len(), 3);
+        match &prog.items[0] {
+            TopLevel::GenericFunction(g) => {
+                assert_eq!(g.name, "id");
+                assert_eq!(g.type_params, vec![("T".into(), None)]);
+                assert_eq!(g.params.len(), 1);
+                assert_eq!(g.params[0].ty, Type::Named("T".into()));
+                assert_eq!(g.ret, Type::Named("T".into()));
+            }
+            other => panic!("expected GenericFunction, got {other:?}"),
+        }
+        match &prog.items[1] {
+            TopLevel::GenericFunction(g) => {
+                assert_eq!(g.name, "print-show");
+                assert_eq!(g.type_params, vec![("T".into(), Some("Show".into()))]);
+            }
+            other => panic!("expected GenericFunction, got {other:?}"),
+        }
+        match &prog.items[2] {
+            TopLevel::Function(f) => assert_eq!(f.name, "add"),
+            other => panic!("expected Function, got {other:?}"),
         }
     }
 }

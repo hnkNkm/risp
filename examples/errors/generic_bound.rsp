@@ -1,0 +1,14 @@
+; Generic call with trait bound but no matching impl.
+;;! error_at: 13:5
+;;! error_contains: missing impl
+
+(trait Show
+  (show [self] -> str))
+
+(defn print-show [T: Show] [x: T] -> unit
+  (println (show x)))
+
+(defn main [] -> i32
+  (do
+    (print-show 1)
+    0))
