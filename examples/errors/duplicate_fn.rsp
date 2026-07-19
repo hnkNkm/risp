@@ -1,0 +1,9 @@
+; Duplicate function definition.
+;;! error_at: 7:1
+;;! error_contains: duplicate definition
+
+(defn foo [] -> i32 0)
+
+(defn foo [] -> i32 1)
+
+(defn main [] -> i32 0)

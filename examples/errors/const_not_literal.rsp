@@ -1,0 +1,7 @@
+; def initializer must be a literal in MVP.
+;;! error_at: 5:13
+;;! error_contains: const initializer must be a literal
+
+(def x: i32 (+ 1 2))
+
+(defn main [] -> i32 0)
