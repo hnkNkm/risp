@@ -756,6 +756,26 @@ impl<'a> Parser<'a> {
                         let _ = start;
                         Ok(Type::Box(Box::new(inner)))
                     }
+                    "Vec" => {
+                        let elem = self.parse_type()?;
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Vec {
+                            elem: Box::new(elem),
+                        })
+                    }
+                    "Rc" => {
+                        let inner = self.parse_type()?;
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Rc(Box::new(inner)))
+                    }
+                    "Weak" => {
+                        let inner = self.parse_type()?;
+                        self.eat(&Token::RParen)?;
+                        let _ = start;
+                        Ok(Type::Weak(Box::new(inner)))
+                    }
                     other => Err(ParseError::UnknownType(other.to_string(), head.span.start)),
                 }
             }
@@ -953,6 +973,15 @@ impl<'a> Parser<'a> {
                     ExprKind::BoxOf {
                         expr: Box::new(expr),
                     },
+                    Span::new(start, rp.span.end),
+                ))
+            }
+            Some("vec") => {
+                self.bump();
+                let elem_ty = self.parse_type()?;
+                let rp = self.eat(&Token::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::VecNew { elem_ty },
                     Span::new(start, rp.span.end),
                 ))
             }

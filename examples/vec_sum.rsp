@@ -1,0 +1,13 @@
+; Unique owned Vec i32: push / get / len.
+;;! stdout: ok: vec
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [v: (Vec i32) (vec i32)]
+    (do
+      (vpush! v 10)
+      (vpush! v 20)
+      (vpush! v 30)
+      (if (and (= (vlen v) 3) (= (vget v 1) 20))
+        (do (println "ok: vec") 0)
+        (do (println "FAIL: vec") 1)))))

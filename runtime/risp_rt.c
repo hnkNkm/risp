@@ -80,3 +80,136 @@ void *risp_box_alloc(size_t size) {
 void risp_box_free(void *p) {
     free(p);
 }
+
+/* ---- Vec i32 ---- */
+
+struct RispVecI32 {
+    int len;
+    int cap;
+    int *data;
+};
+
+RispVecI32 *risp_vec_i32_new(void) {
+    RispVecI32 *v = (RispVecI32 *)malloc(sizeof(RispVecI32));
+    if (!v) {
+        abort();
+    }
+    v->len = 0;
+    v->cap = 0;
+    v->data = NULL;
+    return v;
+}
+
+void risp_vec_i32_push(RispVecI32 *v, int x) {
+    if (!v) {
+        abort();
+    }
+    if (v->len >= v->cap) {
+        int ncap = v->cap == 0 ? 4 : v->cap * 2;
+        int *nd = (int *)realloc(v->data, (size_t)ncap * sizeof(int));
+        if (!nd) {
+            abort();
+        }
+        v->data = nd;
+        v->cap = ncap;
+    }
+    v->data[v->len++] = x;
+}
+
+int risp_vec_i32_get(RispVecI32 *v, int idx) {
+    if (!v || idx < 0 || idx >= v->len) {
+        abort();
+    }
+    return v->data[idx];
+}
+
+int risp_vec_i32_len(RispVecI32 *v) {
+    return v ? v->len : 0;
+}
+
+void risp_vec_i32_free(RispVecI32 *v) {
+    if (!v) {
+        return;
+    }
+    free(v->data);
+    free(v);
+}
+
+/* ---- Rc / Weak ---- */
+
+typedef struct {
+    int strong;
+    int weak;
+} RispRcHeader;
+
+static RispRcHeader *rc_hdr(void *payload) {
+    return ((RispRcHeader *)payload) - 1;
+}
+
+void *risp_rc_alloc(size_t payload_size) {
+    size_t n = sizeof(RispRcHeader) + (payload_size ? payload_size : 1);
+    RispRcHeader *h = (RispRcHeader *)malloc(n);
+    if (!h) {
+        abort();
+    }
+    h->strong = 1;
+    h->weak = 1; /* allocation holds an implicit weak */
+    return (void *)(h + 1);
+}
+
+void *risp_rc_retain(void *payload) {
+    if (payload) {
+        rc_hdr(payload)->strong++;
+    }
+    return payload;
+}
+
+int risp_rc_release_strong(void *payload) {
+    if (!payload) {
+        return 0;
+    }
+    RispRcHeader *h = rc_hdr(payload);
+    h->strong--;
+    return h->strong;
+}
+
+void risp_rc_after_payload_drop(void *payload) {
+    if (!payload) {
+        return;
+    }
+    RispRcHeader *h = rc_hdr(payload);
+    h->weak--;
+    if (h->weak <= 0) {
+        free(h);
+    }
+}
+
+void *risp_weak_from(void *payload) {
+    if (payload) {
+        rc_hdr(payload)->weak++;
+    }
+    return payload;
+}
+
+void *risp_weak_upgrade(void *payload) {
+    if (!payload) {
+        return NULL;
+    }
+    RispRcHeader *h = rc_hdr(payload);
+    if (h->strong <= 0) {
+        return NULL;
+    }
+    h->strong++;
+    return payload;
+}
+
+void risp_weak_release(void *payload) {
+    if (!payload) {
+        return;
+    }
+    RispRcHeader *h = rc_hdr(payload);
+    h->weak--;
+    if (h->strong <= 0 && h->weak <= 0) {
+        free(h);
+    }
+}

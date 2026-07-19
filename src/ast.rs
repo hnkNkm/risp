@@ -38,6 +38,12 @@ pub enum Type {
     Ref(Box<Type>),
     /// Unique heap box. Written `(Box T)`.
     Box(Box<Type>),
+    /// Dynamic vector. Written `(Vec T)`. MVP: elem `i32` only.
+    Vec { elem: Box<Type> },
+    /// Shared ownership. Written `(Rc T)`.
+    Rc(Box<Type>),
+    /// Weak reference to an `Rc`. Written `(Weak T)`.
+    Weak(Box<Type>),
 }
 
 impl fmt::Display for Type {
@@ -54,6 +60,9 @@ impl fmt::Display for Type {
             Type::Named(n) => f.write_str(n),
             Type::Ref(inner) => write!(f, "&{inner}"),
             Type::Box(inner) => write!(f, "(Box {inner})"),
+            Type::Vec { elem } => write!(f, "(Vec {elem})"),
+            Type::Rc(inner) => write!(f, "(Rc {inner})"),
+            Type::Weak(inner) => write!(f, "(Weak {inner})"),
         }
     }
 }
@@ -66,9 +75,21 @@ impl Type {
         )
     }
 
-    /// Fields / enum payloads in ADTs (primitives, `str`; `Box` in ADT is follow-up).
+    /// Fields / enum payloads in ADTs.
+    /// Allows primitives, `str`, `Box`/`Rc`/`Weak`/`Vec` (inners may be `Named` for recursion).
     pub fn is_adt_field_allowed(&self) -> bool {
-        self.is_array_elem_allowed() || matches!(self, Type::Str)
+        if self.is_array_elem_allowed() || matches!(self, Type::Str) {
+            return true;
+        }
+        match self {
+            Type::Box(inner) | Type::Rc(inner) | Type::Weak(inner) => {
+                inner.is_adt_field_allowed() || matches!(inner.as_ref(), Type::Named(_))
+            }
+            Type::Vec { elem } => {
+                elem.is_array_elem_allowed() || matches!(elem.as_ref(), Type::Str)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -209,6 +230,10 @@ pub enum ExprKind {
     /// `(box e)` — allocate a unique heap box owning `e`
     BoxOf {
         expr: Box<Expr>,
+    },
+    /// `(vec T)` — empty unique vector of element type `T` (MVP: `i32`)
+    VecNew {
+        elem_ty: Type,
     },
     /// `(field e name)` — struct field access
     Field {

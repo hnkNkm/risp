@@ -1,0 +1,10 @@
+; Shared Rc: clone retains; both drop safely.
+;;! stdout: ok: rc
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [a: (Rc i32) (rc 42)]
+    (let [b: (Rc i32) (rc-clone a)]
+      (if (and (= (rc-is-null a) false) (= (rc-is-null b) false))
+        (do (println "ok: rc") 0)
+        (do (println "FAIL: rc") 1)))))

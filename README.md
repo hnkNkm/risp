@@ -41,20 +41,23 @@ ok: f64 cmp
 | `bool` | 真偽値 |
 | `str` | 動的文字列（参照カウント / `runtime/risp_rt.c`） |
 | `(Array T N)` | 固定長配列（要素は数値 / `bool`。ローカルのみ。代入は参照意味論） |
-| 名前付き型 | `struct` / `enum`（フィールド・ペイロードは数値 / `bool` / `str`）。値渡しでムーブ |
-| `(Box T)` | 一意所有のヒープ箱。`(box e)` / `(unbox e)`。ムーブのみ |
-| `(Ref T)` / `&T` | 共有借用。LLVM 上は `T` へのポインタ。`(borrow x)`（ローカル変数）で生成 |
+| 名前付き型 | `struct` / `enum`（フィールド・ペイロードは数値 / `bool` / `str` / `Box` / `Rc` / `Weak` / `Vec`）。値渡しでムーブ |
+| `(Box T)` | 一意所有のヒープ箱。`(box e)` / `(unbox e)`。ムーブのみ。再帰 ADT 可（`(Box SelfName)`） |
+| `(Vec T)` | 一意所有の動的配列。MVP は要素 `i32` のみ。`(vec i32)` / `vpush!` / `vget` / `vlen` |
+| `(Rc T)` | 共有所有。`(rc e)` / `(rc-clone e)` / `(rc-is-null e)`。ロード時 retain |
+| `(Weak T)` | 弱参照。`(downgrade rc)` / `(upgrade w)`（死んでいれば null Rc） |
+| `(Ref T)` / `&T` | 共有借用。LLVM 上は `T` へのポインタ。`(borrow x)`（ローカル変数）で生成。関数引数可 |
 
 ### メモリ管理
 
-- 数値・`bool`・固定長配列・`str`（Rc）・`unit` は **Copy**（使用してもムーブしない）
-- `struct` / `enum`（`Named`）と `(Box T)` は **ムーブ**（値渡し・`let` 束縛などで消費後は再利用不可）
-- `(borrow x)` で共有借用 `&T`（`x` はローカル変数。ムーブしない。複数回可）。`(field e f)` は `T` / `&T` 両対応（`&T` は GEP）
-- 関数から `Ref` は返せない（ライフタイム未対応）。参照からのムーブアウトも不可
-- **`str` は参照カウント**（`risp_str_*`）。ADT の `str` フィールド／ペイロードも drop/retain で再帰処理
-- **`(Box T)` は一意ヒープ**（`risp_box_alloc` / `risp_box_free`）。`unbox` で中身をムーブアウトして箱を解放
-- codegen は `needs_drop` / `emit_drop` / `emit_retain` / `store_owned` / `load_owned` で所有権を一般化
-- 汎用 `Rc<T>` や `Vec` は未実装（`str` が Rc の先行実装）。需要に応じて追加予定
+- 数値・`bool`・固定長配列・`str` / `(Rc T)` / `(Weak T)`（共有）・`unit` は **Copy**（使用してもムーブしない。`str`/`Rc`/`Weak` は retain）
+- `struct` / `enum`（`Named`）、`(Box T)`、`(Vec T)` は **ムーブ**（消費時に alloca を zero し、スコープ終端 drop と二重解放しない）
+- `(set! x v)` は旧値を drop して再束縛（ムーブ済みフラグもクリア）
+- `(borrow x)` で共有借用 `&T`（ムーブしない）。`(field e f)` はローカル/`&T` を GEP。関数引数に `&T` 可
+- **関数から `Ref` は返せない**。`Ref` を ADT フィールド／グローバルには置けない → 「呼び出しを超えて参照を延命できない」を制限付きで保証
+- **`str`**（`risp_str_*`）と **`(Rc T)`**（`risp_rc_*`）は参照カウント。payload drop は strong==0 時に codegen が `emit_drop`
+- **`(Box T)`** / **`(Vec i32)`** は一意ヒープ。再帰 enum（`(Cons (Box List))`）は Named 向け drop 関数でコンパイル時再帰を回避
+- codegen: `needs_drop` / `emit_drop` / `emit_retain` / `store_owned` / `load_owned`（Move=take / Place=観測）
 
 ### 構文
 
@@ -97,11 +100,27 @@ ok: f64 cmp
 (let [p: Point (Point 3 4)]
   (+ (field p x) (field (borrow p) y)))
 
-;; 一意ヒープ Box
+;; 一意ヒープ Box（関数へムーブ可）
 (let [b: (Box i32) (box 42)]
   (unbox b))
 
-;; 列挙型 + パターンマッチ（網羅必須。unit / 単一ペイロード。str 可）
+;; 再帰 enum（ペイロードの Named は前方参照可）
+(enum List
+  Nil
+  Cons (Box List))
+
+;; Vec i32（一意所有。MVP は i32 のみ）
+(let [v: (Vec i32) (vec i32)]
+  (do
+    (vpush! v 1)
+    (vget v 0)))
+
+;; Rc / Weak
+(let [a: (Rc i32) (rc 1)]
+  (let [w: (Weak i32) (downgrade a)]
+    (rc-is-null (upgrade w))))
+
+;; 列挙型 + パターンマッチ（網羅必須。unit / 単一ペイロード）
 (enum Opt
   None
   Some i32)
@@ -183,9 +202,11 @@ Clojure風に、関数の仮引数と `let` の束縛は角括弧で囲む。
 | 代入 | `(set! name value)`（ローカル / 仮引数。型は Unit） |
 | ループ | `(while cond body)` / `(loop body)` / `(break)`（値は Unit） |
 | 配列 | `(array T ...)` / `aget` / `aset!` / `alen`（関数の引数・戻り値には未対応） |
-| ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)`（フィールドに `str` 可） |
+| ADT | `(struct Name [f: T ...])` / `(enum Name V ...)` / `(field e f)` / `(match e ...)`（`str` / `Box` / `Rc` / `Weak` / `Vec` 可。再帰は `Box`/`Rc` 経由） |
 | Box | `(box e)` / `(unbox e)`（一意ヒープ。`(Box T)`） |
-| 所有権 | `(borrow x)` → `&T`（ローカルへのポインタ。Named をムーブしない）。ムーブ後の再利用は型エラー |
+| Vec | `(vec i32)` / `vpush!` / `vget` / `vlen`（MVP: 要素 `i32` のみ。ムーブ型） |
+| Rc / Weak | `(rc e)` / `rc-clone` / `downgrade` / `upgrade` / `rc-is-null` |
+| 所有権 | `(borrow x)` → `&T`（関数引数可・戻り値不可）。ムーブ後の再利用は型エラー |
 | trait | `(trait Name (method [self ...] -> T)*)` / `(impl Name for T ...)`（静的ディスパッチ。先頭引数は bare `self` 可） |
 | ジェネリクス | `(defn f [T] [x: T] -> T ...)` / `(defn f [T: Trait] [x: T] -> ...)`（呼び出し時に単相化。struct/enum は未対応） |
 | マクロ | `(defmacro name [params] template)`（型検査前に Call をテンプレートへ置換。非衛生的） |
@@ -332,10 +353,11 @@ cargo run -- run examples/hello.rsp
 - [x] モジュール（`(import name)` / 修飾名 `mod/f` MVP）
 
 ### Phase 5 — Nice to have
-- [x] 所有権・借用検査（Named / Box ムーブ / `(borrow)` 実ポインタ / field の auto-deref。ライフタイムなし）
-- [x] `emit_drop` 一般化・ADT の `str`・`(Box T)`・本物の `&T` ポインタ
+- [x] 所有権・借用検査（Named / Box / Vec ムーブ + take-on-move codegen。`(borrow)` / Ref 引数。戻り値・ADT への Ref は禁止）
+- [x] `emit_drop` 一般化・ADT の `str` / `Box`・再帰 enum・本物の `&T` ポインタ
+- [x] `(Rc T)` / `(Weak T)` / `(Vec i32)`（ランタイム `risp_rc_*` / `risp_vec_i32_*`）
 - [x] FFI（`(extern "C" …)`）
-- [ ] 汎用 `Rc<T>` / `Vec`（需要ベース）
+- [ ] `Vec` の要素型拡張（`i64` / `bool` / `str` など）
 - [ ] モジュール検索パスの拡張 / 再エクスポート
 
 ## ライセンス

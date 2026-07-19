@@ -1,0 +1,11 @@
+; Returning Ref is forbidden (no lifetimes).
+;;! error_at: 7:1
+;;! error_contains: cannot return a reference
+
+(struct Point [x: i32, y: i32])
+
+(defn bad [p: Point] -> (Ref Point)
+  (borrow p))
+
+(defn main [] -> i32
+  0)
