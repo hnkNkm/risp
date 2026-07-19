@@ -1,0 +1,14 @@
+; Weak upgrade: alive while a strong Rc exists; null after last strong drop.
+;;! stdout: ok: weak
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [a: (Rc i32) (rc 1)]
+    (let [w: (Weak i32) (downgrade a)]
+      (if (rc-is-null (upgrade w))
+        (do (println "FAIL: weak alive") 1)
+        (do
+          (set! a (rc 2))
+          (if (rc-is-null (upgrade w))
+            (do (println "ok: weak") 0)
+            (do (println "FAIL: weak dead") 1)))))))

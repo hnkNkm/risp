@@ -171,7 +171,11 @@ enum UseMode {
 }
 
 fn is_move_type(ty: &Type) -> bool {
-    matches!(ty, Type::Named(_) | Type::Box(_))
+    matches!(ty, Type::Named(_) | Type::Box(_) | Type::Vec { .. })
+}
+
+fn is_vec_elem_ok(ty: &Type) -> bool {
+    matches!(ty, Type::I32)
 }
 
 fn named_struct_of(ty: &Type) -> Option<&str> {
@@ -317,6 +321,8 @@ impl TypeCk {
         self.mono_fns.clear();
 
         // Collect type definitions first.
+        // Insert names before validating fields/payloads so recursive
+        // `(Box SelfName)` / `(Rc SelfName)` forward references resolve.
         for it in &prog.items {
             match it {
                 TopLevel::Struct(s) => {
@@ -324,6 +330,7 @@ impl TypeCk {
                     if s.fields.is_empty() {
                         return Err(TypeError::EmptyStruct(s.name.clone(), s.span));
                     }
+                    self.structs.insert(s.name.clone(), s.clone());
                     let mut seen = HashSet::new();
                     for f in &s.fields {
                         if !seen.insert(f.name.clone()) {
@@ -332,14 +339,15 @@ impl TypeCk {
                         if !f.ty.is_adt_field_allowed() {
                             return Err(TypeError::BadAdtField(f.ty.clone(), f.span));
                         }
+                        self.resolve_type(&f.ty, f.span)?;
                     }
-                    self.structs.insert(s.name.clone(), s.clone());
                 }
                 TopLevel::Enum(e) => {
                     self.register_name(&e.name, e.span)?;
                     if e.variants.is_empty() {
                         return Err(TypeError::EmptyEnum(e.name.clone(), e.span));
                     }
+                    self.enums.insert(e.name.clone(), e.clone());
                     let mut seen = HashSet::new();
                     for (i, v) in e.variants.iter().enumerate() {
                         if !seen.insert(v.name.clone()) {
@@ -350,6 +358,7 @@ impl TypeCk {
                             if !p.is_adt_field_allowed() {
                                 return Err(TypeError::BadAdtField(p.clone(), v.span));
                             }
+                            self.resolve_type(p, v.span)?;
                         }
                         self.variants.insert(
                             v.name.clone(),
@@ -360,7 +369,6 @@ impl TypeCk {
                             },
                         );
                     }
-                    self.enums.insert(e.name.clone(), e.clone());
                 }
                 _ => {}
             }
@@ -680,7 +688,19 @@ impl TypeCk {
             }
             Type::Array { elem, .. } => self.resolve_type(elem, span),
             Type::Ref(inner) => self.resolve_type(inner, span),
-            Type::Box(inner) => self.resolve_type(inner, span),
+            Type::Box(inner) | Type::Rc(inner) | Type::Weak(inner) => {
+                self.resolve_type(inner, span)
+            }
+            Type::Vec { elem } => {
+                if !is_vec_elem_ok(elem) {
+                    return Err(TypeError::BadOperand {
+                        op: "Vec".into(),
+                        ty: elem.as_ref().clone(),
+                        span,
+                    });
+                }
+                self.resolve_type(elem, span)
+            }
             _ => Ok(()),
         }
     }
@@ -702,7 +722,19 @@ impl TypeCk {
             }
             Type::Array { elem, .. } => self.resolve_type_with_params(elem, span, type_params),
             Type::Ref(inner) => self.resolve_type_with_params(inner, span, type_params),
-            Type::Box(inner) => self.resolve_type_with_params(inner, span, type_params),
+            Type::Box(inner) | Type::Rc(inner) | Type::Weak(inner) => {
+                self.resolve_type_with_params(inner, span, type_params)
+            }
+            Type::Vec { elem } => {
+                if !is_vec_elem_ok(elem) {
+                    return Err(TypeError::BadOperand {
+                        op: "Vec".into(),
+                        ty: elem.as_ref().clone(),
+                        span,
+                    });
+                }
+                self.resolve_type_with_params(elem, span, type_params)
+            }
             _ => Ok(()),
         }
     }
@@ -868,7 +900,10 @@ impl TypeCk {
             }
             ExprKind::BoxOf { expr } => {
                 let inner = self.check_expr(expr, env, UseMode::Move)?;
-                if matches!(inner, Type::Unit | Type::Array { .. } | Type::Ref(_)) {
+                if matches!(
+                    inner,
+                    Type::Unit | Type::Array { .. } | Type::Ref(_) | Type::Weak(_)
+                ) {
                     return Err(TypeError::BadOperand {
                         op: "box".into(),
                         ty: inner,
@@ -876,6 +911,19 @@ impl TypeCk {
                     });
                 }
                 Type::Box(Box::new(inner))
+            }
+            ExprKind::VecNew { elem_ty } => {
+                self.resolve_type(elem_ty, span)?;
+                if !is_vec_elem_ok(elem_ty) {
+                    return Err(TypeError::BadOperand {
+                        op: "vec".into(),
+                        ty: elem_ty.clone(),
+                        span,
+                    });
+                }
+                Type::Vec {
+                    elem: Box::new(elem_ty.clone()),
+                }
             }
             ExprKind::Field { base, field } => {
                 let bt = self.check_expr(base, env, UseMode::Ref)?;
@@ -1378,6 +1426,177 @@ impl TypeCk {
                 };
                 Ok(*inner)
             }
+            "vpush!" => {
+                if args.len() != 2 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 2,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                // Mutate in place: borrow the local Vec (Ref mode).
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                let Type::Vec { elem } = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                let v_span = args[1].span;
+                let vt = self.check_expr(&mut args[1], env, UseMode::Move)?;
+                expect(&elem, &vt, v_span)?;
+                Ok(Type::Unit)
+            }
+            "vget" => {
+                if args.len() != 2 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 2,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                let Type::Vec { elem } = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                let i_span = args[1].span;
+                let it = self.check_expr(&mut args[1], env, UseMode::Move)?;
+                expect(&Type::I32, &it, i_span)?;
+                Ok(*elem)
+            }
+            "vlen" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                if !matches!(at, Type::Vec { .. }) {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                }
+                Ok(Type::I32)
+            }
+            "rc" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Move)?;
+                if matches!(
+                    at,
+                    Type::Unit | Type::Array { .. } | Type::Ref(_) | Type::Weak(_)
+                ) {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                }
+                Ok(Type::Rc(Box::new(at)))
+            }
+            "rc-clone" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                let Type::Rc(_) = &at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                Ok(at)
+            }
+            "downgrade" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                let Type::Rc(inner) = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                Ok(Type::Weak(inner))
+            }
+            "upgrade" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                let Type::Weak(inner) = at else {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                };
+                // May be null at runtime; type is still `(Rc T)`.
+                Ok(Type::Rc(inner))
+            }
+            "rc-is-null" => {
+                if args.len() != 1 {
+                    return Err(TypeError::Arity {
+                        name: callee.clone(),
+                        expected: 1,
+                        got: args.len(),
+                        span: call_span,
+                    });
+                }
+                let a_span = args[0].span;
+                let at = self.check_expr(&mut args[0], env, UseMode::Ref)?;
+                if !matches!(at, Type::Rc(_)) {
+                    return Err(TypeError::BadOperand {
+                        op: callee.clone(),
+                        ty: at,
+                        span: a_span,
+                    });
+                }
+                Ok(Type::Bool)
+            }
             _ => {
                 if self.generic_fns.contains_key(callee.as_str()) {
                     return self.check_generic_call(callee, args, env, call_span);
@@ -1525,6 +1744,11 @@ fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         },
         Type::Ref(inner) => Type::Ref(Box::new(subst_type(inner, subst))),
         Type::Box(inner) => Type::Box(Box::new(subst_type(inner, subst))),
+        Type::Vec { elem } => Type::Vec {
+            elem: Box::new(subst_type(elem, subst)),
+        },
+        Type::Rc(inner) => Type::Rc(Box::new(subst_type(inner, subst))),
+        Type::Weak(inner) => Type::Weak(Box::new(subst_type(inner, subst))),
         other => other.clone(),
     }
 }
@@ -1570,6 +1794,9 @@ fn subst_expr(e: &mut Expr, subst: &HashMap<String, Type>) {
             }
         }
         ExprKind::BoxOf { expr } => subst_expr(expr, subst),
+        ExprKind::VecNew { elem_ty } => {
+            *elem_ty = subst_type(elem_ty, subst);
+        }
         ExprKind::Field { base, .. } => subst_expr(base, subst),
         ExprKind::Match { scrutinee, arms } => {
             subst_expr(scrutinee, subst);
@@ -1627,6 +1854,30 @@ fn unify_type_param(
         },
         Type::Box(pe) => match concrete {
             Type::Box(ce) => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        Type::Vec { elem: pe } => match concrete {
+            Type::Vec { elem: ce } => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        Type::Rc(pe) => match concrete {
+            Type::Rc(ce) => unify_type_param(pe, ce, type_params, subst, span),
+            _ => Err(TypeError::Mismatch {
+                expected: pattern.clone(),
+                found: concrete.clone(),
+                span,
+            }),
+        },
+        Type::Weak(pe) => match concrete {
+            Type::Weak(ce) => unify_type_param(pe, ce, type_params, subst, span),
             _ => Err(TypeError::Mismatch {
                 expected: pattern.clone(),
                 found: concrete.clone(),

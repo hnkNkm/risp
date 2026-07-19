@@ -1,0 +1,18 @@
+; Recursive enum with Box payload (forward-ref Named inside Box).
+;;! stdout: ok: list-box
+;;! exit: 0
+
+(enum List
+  Nil
+  Cons (Box List))
+
+(defn len [xs: List] -> i32
+  (match xs
+    (Nil 0)
+    (Cons b (+ 1 (len (unbox b))))))
+
+(defn main [] -> i32
+  (let [xs: List (Cons (box (Cons (box (Nil)))))]
+    (if (= (len xs) 2)
+      (do (println "ok: list-box") 0)
+      (do (println "FAIL: list-box") 1))))

@@ -15,3 +15,10 @@ result-*
 /borrow_ptr
 /box_i32
 /struct_str
+/box_move
+/list_box
+/rc_share
+/ref_param
+/vec_sum
+/weak_cycle
+/ownership_move

@@ -1,0 +1,15 @@
+; Function-crossing borrow: Ref param is ok; cannot outlive the call
+; (no Ref returns, no Ref in ADT/globals).
+;;! stdout: ok: ref-param
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(defn point-x [r: (Ref Point)] -> i32
+  (field r x))
+
+(defn main [] -> i32
+  (let [p: Point (Point 9 1)]
+    (if (= (point-x (borrow p)) 9)
+      (do (println "ok: ref-param") 0)
+      (do (println "FAIL: ref-param") 1))))

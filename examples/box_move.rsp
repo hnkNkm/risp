@@ -1,0 +1,12 @@
+; Move a Box into a function (take-on-move; no double-free at scope end).
+;;! stdout: ok: box-move
+;;! exit: 0
+
+(defn take-box [b: (Box i32)] -> i32
+  (unbox b))
+
+(defn main [] -> i32
+  (let [b: (Box i32) (box 7)]
+    (if (= (take-box b) 7)
+      (do (println "ok: box-move") 0)
+      (do (println "FAIL: box-move") 1))))

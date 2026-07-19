@@ -119,6 +119,7 @@ fn expand_expr(
             }
         }
         ExprKind::BoxOf { expr } => expand_expr(expr, macros, depth)?,
+        ExprKind::VecNew { .. } => {}
         ExprKind::Field { base, .. } => expand_expr(base, macros, depth)?,
         ExprKind::Match { scrutinee, arms } => {
             expand_expr(scrutinee, macros, depth)?;
@@ -219,6 +220,9 @@ fn subst_expr(expr: &Expr, map: &HashMap<&str, &Expr>) -> Expr {
         },
         ExprKind::BoxOf { expr } => ExprKind::BoxOf {
             expr: Box::new(subst_expr(expr, map)),
+        },
+        ExprKind::VecNew { elem_ty } => ExprKind::VecNew {
+            elem_ty: elem_ty.clone(),
         },
         ExprKind::Field { base, field } => ExprKind::Field {
             base: Box::new(subst_expr(base, map)),
