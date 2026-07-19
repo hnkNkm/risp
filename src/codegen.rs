@@ -5,6 +5,7 @@ use crate::typeck::TypeCk;
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
@@ -30,6 +31,14 @@ pub struct Codegen<'ctx> {
     consts: HashMap<String, (Type, BasicValueEnum<'ctx>)>,
     /// per-function locals: name -> (alloca, type)
     locals: HashMap<String, (PointerValue<'ctx>, Type)>,
+    /// Parameter locals at function entry (for TCO reset).
+    param_locals: HashMap<String, (PointerValue<'ctx>, Type)>,
+    /// Ordered parameter names of the function being emitted.
+    param_names: Vec<String>,
+    /// Name of the function currently being emitted (for self-TCO).
+    current_fn: Option<String>,
+    /// Loop header for self-tail-call optimization.
+    loop_header: Option<BasicBlock<'ctx>>,
     str_count: usize,
 }
 
@@ -45,6 +54,10 @@ impl<'ctx> Codegen<'ctx> {
             fn_types: HashMap::new(),
             consts: HashMap::new(),
             locals: HashMap::new(),
+            param_locals: HashMap::new(),
+            param_names: Vec::new(),
+            current_fn: None,
+            loop_header: None,
             str_count: 0,
         }
     }
@@ -110,22 +123,132 @@ impl<'ctx> Codegen<'ctx> {
     fn emit_function(&mut self, f: &Function) -> Result<(), CodegenError> {
         let fv = self.fns[&f.name];
         let entry = self.context.append_basic_block(fv, "entry");
+        let loop_bb = self.context.append_basic_block(fv, "loop");
         self.builder.position_at_end(entry);
 
         // allocate parameters as locals
         self.locals.clear();
+        self.param_names.clear();
         for (i, p) in f.params.iter().enumerate() {
-            let arg = fv.get_nth_param(i as u32).ok_or_else(|| CodegenError::Internal("missing param".into()))?;
+            let arg = fv
+                .get_nth_param(i as u32)
+                .ok_or_else(|| CodegenError::Internal("missing param".into()))?;
             let alloca = self.create_entry_alloca(fv, &p.name, &p.ty);
-            self.builder.build_store(alloca, arg).map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            self.builder
+                .build_store(alloca, arg)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
             self.locals.insert(p.name.clone(), (alloca, p.ty.clone()));
+            self.param_names.push(p.name.clone());
         }
+        self.param_locals = self.locals.clone();
+        self.current_fn = Some(f.name.clone());
+        self.loop_header = Some(loop_bb);
 
-        let ret_val = self.emit_expr(&f.body)?;
+        self.builder
+            .build_unconditional_branch(loop_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
-        match (&f.ret, ret_val) {
+        self.builder.position_at_end(loop_bb);
+        // Body in tail position: ends with `ret` or a self-TCO branch back to `loop`.
+        self.emit_tail(&f.body, &f.ret)?;
+
+        self.current_fn = None;
+        self.loop_header = None;
+        self.param_locals.clear();
+        self.param_names.clear();
+        Ok(())
+    }
+
+    /// Emit an expression in tail position: always terminates with `ret` or a
+    /// self-tail-call branch to the loop header (TCO).
+    fn emit_tail(&mut self, e: &Expr, ret_ty: &Type) -> Result<(), CodegenError> {
+        match &e.kind {
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let cv = self
+                    .emit_expr(cond)?
+                    .ok_or_else(|| CodegenError::Internal("if cond".into()))?
+                    .into_int_value();
+                let fv = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_parent()
+                    .unwrap();
+                let then_bb = self.context.append_basic_block(fv, "then.tail");
+                let else_bb = self.context.append_basic_block(fv, "else.tail");
+                self.builder
+                    .build_conditional_branch(cv, then_bb, else_bb)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+                self.builder.position_at_end(then_bb);
+                self.emit_tail(then_branch, ret_ty)?;
+                self.builder.position_at_end(else_bb);
+                self.emit_tail(else_branch, ret_ty)?;
+                Ok(())
+            }
+            ExprKind::Let { bindings, body } => {
+                let mut prev: Vec<(String, Option<(PointerValue<'ctx>, Type)>)> = Vec::new();
+                let fv = self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_parent()
+                    .unwrap();
+                for b in bindings {
+                    let v = self
+                        .emit_expr(&b.value)?
+                        .ok_or_else(|| CodegenError::Internal("let value".into()))?;
+                    let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
+                    self.builder
+                        .build_store(alloca, v)
+                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                    prev.push((
+                        b.name.clone(),
+                        self.locals.insert(b.name.clone(), (alloca, b.ty.clone())),
+                    ));
+                }
+                self.emit_tail(body, ret_ty)?;
+                // Body always terminates; restore is only for map hygiene if we
+                // ever resume — keep param_locals authoritative for TCO.
+                let _ = prev;
+                Ok(())
+            }
+            ExprKind::Do(exprs) => {
+                if exprs.is_empty() {
+                    return self.emit_return(None, ret_ty);
+                }
+                let last = exprs.len() - 1;
+                for ex in &exprs[..last] {
+                    let _ = self.emit_expr(ex)?;
+                }
+                self.emit_tail(&exprs[last], ret_ty)
+            }
+            ExprKind::Call { callee, args }
+                if self.current_fn.as_deref() == Some(callee.as_str()) =>
+            {
+                self.emit_self_tco(args)
+            }
+            _ => {
+                let v = self.emit_expr(e)?;
+                self.emit_return(v, ret_ty)
+            }
+        }
+    }
+
+    fn emit_return(
+        &self,
+        ret_val: Option<BasicValueEnum<'ctx>>,
+        ret_ty: &Type,
+    ) -> Result<(), CodegenError> {
+        match (ret_ty, ret_val) {
             (Type::Unit, _) => {
-                self.builder.build_return(None).map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.builder
+                    .build_return(None)
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
             }
             (_, Some(v)) => {
                 self.builder
@@ -134,10 +257,42 @@ impl<'ctx> Codegen<'ctx> {
             }
             (_, None) => {
                 return Err(CodegenError::Internal(
-                    "function body produced no value but return type is non-unit".into(),
+                    "tail expr produced no value but return type is non-unit".into(),
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Self-tail-call: update parameter allocas and jump to the loop header.
+    fn emit_self_tco(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
+        if args.len() != self.param_names.len() {
+            return Err(CodegenError::Internal(
+                "self-TCO arity mismatch (typeck should have caught this)".into(),
+            ));
+        }
+        // Evaluate all arguments first (left-to-right) before storing, so that
+        // reads of current parameters see pre-update values.
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self
+                .emit_expr(a)?
+                .ok_or_else(|| CodegenError::Internal("tco arg".into()))?;
+            values.push(v);
+        }
+        for (name, v) in self.param_names.iter().zip(values) {
+            let (ptr, _) = self.param_locals[name];
+            self.builder
+                .build_store(ptr, v)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+        self.locals = self.param_locals.clone();
+        let loop_bb = self
+            .loop_header
+            .ok_or_else(|| CodegenError::Internal("TCO without loop header".into()))?;
+        self.builder
+            .build_unconditional_branch(loop_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         Ok(())
     }
 
