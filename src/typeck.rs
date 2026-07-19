@@ -63,6 +63,14 @@ impl TypeCk {
     }
 
     pub fn check(&mut self, prog: &mut Program) -> Result<(), TypeError> {
+        self.check_ex(prog, true)
+    }
+
+    /// Type-check a program. When `require_main` is false (REPL definitions),
+    /// a missing `main` is allowed; a present `main` must still be `[] -> i32`.
+    pub fn check_ex(&mut self, prog: &mut Program, require_main: bool) -> Result<(), TypeError> {
+        self.fns.clear();
+        self.consts.clear();
         // collect signatures first (allow forward references)
         for it in &prog.items {
             match it {
@@ -85,7 +93,7 @@ impl TypeCk {
             }
         }
 
-        // ensure main exists with signature `[] -> i32`
+        // ensure main exists with signature `[] -> i32` (optional in REPL)
         match self.fns.get("main") {
             Some(sig) if sig.params.is_empty() && sig.ret == Type::I32 => {}
             Some(_) => {
@@ -104,7 +112,8 @@ impl TypeCk {
                     span: main_span,
                 });
             }
-            None => return Err(TypeError::NoMain),
+            None if require_main => return Err(TypeError::NoMain),
+            None => {}
         }
 
         for it in &mut prog.items {

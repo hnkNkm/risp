@@ -139,6 +139,7 @@ risp build hello.rsp        # ./hello を生成
 risp run   hello.rsp        # ビルドして実行
 risp emit-llvm hello.rsp    # LLVM IR を stdout に出力
 risp emit-ast  hello.rsp    # AST を dump（デバッグ用）
+risp repl                   # 対話 REPL（LLVM JIT）
 ```
 
 開発中は `cargo risp` エイリアス（`.cargo/config.toml` で定義）が便利:
@@ -146,7 +147,22 @@ risp emit-ast  hello.rsp    # AST を dump（デバッグ用）
 ```sh
 cargo risp run examples/hello.rsp
 cargo risp emit-llvm examples/hello.rsp
+cargo risp repl
 ```
+
+### REPL
+
+```text
+risp> (defn add [x: i32, y: i32] -> i32 (+ x y))
+; ok
+risp> (add 1 2)
+3
+risp> :quit
+```
+
+- `defn` / `def` はセッションに蓄積される（`:clear` で破棄、`:defs` で一覧）
+- それ以外の式は JIT 評価して `println` する
+- 括弧が閉じるまで複数行入力可
 
 ## エラー表示
 
@@ -227,7 +243,7 @@ cargo run -- run examples/hello.rsp
 - [ ] trait / impl
 - [ ] ジェネリクス（モノモーフィゼーション）
 - [ ] マクロ（defmacro）
-- [ ] REPL（inkwell::execution_engine でJIT）
+- [x] REPL（inkwell::execution_engine でJIT）
 
 ### Phase 5 — Nice to have
 - [ ] 所有権・借用検査
