@@ -1,0 +1,49 @@
+; PR #26 smoke: struct / enum / field / match / ADT in signatures.
+;;! stdout: ok: adt-smoke
+;;! exit: 0
+
+(struct Point [x: i32, y: i32])
+
+(struct Rect [w: i32, h: i32])
+
+(enum Opt
+  None
+  Some i32)
+
+(enum Color
+  Red
+  Green
+  Blue)
+
+(defn make-point [x: i32, y: i32] -> Point
+  (Point x y))
+
+(defn area [r: Rect] -> i32
+  (* (field r w) (field r h)))
+
+(defn unwrap-or [o: Opt, d: i32] -> i32
+  (match o
+    (None d)
+    (Some n n)))
+
+(defn color-code [c: Color] -> i32
+  (match c
+    (Red 1)
+    (Green 2)
+    (Blue 3)))
+
+(defn main [] -> i32
+  (let [p: Point (make-point 3 4)
+        r: Rect (Rect 5 6)
+        o1: Opt (None)
+        o2: Opt (Some 42)
+        ok: bool (and (= (field p x) 3)
+                      (and (= (field p y) 4)
+                           (and (= (area r) 30)
+                                (and (= (unwrap-or o1 10) 10)
+                                     (and (= (unwrap-or o2 0) 42)
+                                          (and (= (color-code (Red)) 1)
+                                               (= (color-code (Blue)) 3)))))))]
+    (if ok
+      (do (println "ok: adt-smoke") 0)
+      (do (println "FAIL: adt-smoke") 1))))

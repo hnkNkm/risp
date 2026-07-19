@@ -1,0 +1,12 @@
+; payload variant requires a binding in match.
+;;! error_at: 12:5
+;;! error_contains: requires a binding
+
+(enum Opt
+  None
+  Some i32)
+
+(defn main [] -> i32
+  (match (Some 1)
+    (None 0)
+    (Some 1)))
