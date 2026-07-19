@@ -36,6 +36,8 @@ pub enum Type {
     Named(String),
     /// Shared borrow of `T`. Written `&T` in Display; parse as `(Ref T)`.
     Ref(Box<Type>),
+    /// Unique heap box. Written `(Box T)`.
+    Box(Box<Type>),
 }
 
 impl fmt::Display for Type {
@@ -51,6 +53,7 @@ impl fmt::Display for Type {
             Type::Array { elem, len } => write!(f, "(Array {elem} {len})"),
             Type::Named(n) => f.write_str(n),
             Type::Ref(inner) => write!(f, "&{inner}"),
+            Type::Box(inner) => write!(f, "(Box {inner})"),
         }
     }
 }
@@ -63,9 +66,9 @@ impl Type {
         )
     }
 
-    /// Fields / enum payloads in MVP ADTs.
+    /// Fields / enum payloads in ADTs (primitives, `str`; `Box` in ADT is follow-up).
     pub fn is_adt_field_allowed(&self) -> bool {
-        self.is_array_elem_allowed()
+        self.is_array_elem_allowed() || matches!(self, Type::Str)
     }
 }
 
@@ -202,6 +205,10 @@ pub enum ExprKind {
     ArrayLit {
         elem_ty: Type,
         elems: Vec<Expr>,
+    },
+    /// `(box e)` — allocate a unique heap box owning `e`
+    BoxOf {
+        expr: Box<Expr>,
     },
     /// `(field e name)` — struct field access
     Field {

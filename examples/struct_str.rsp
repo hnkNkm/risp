@@ -1,0 +1,13 @@
+; Struct with a str field (Rc); field access retains.
+;;! stdout: hello
+;;! stdout: ok: struct-str
+;;! exit: 0
+
+(struct Name [s: str])
+
+(defn main [] -> i32
+  (let [n: Name (Name "hello")]
+    (do
+      (println (field n s))
+      (println "ok: struct-str")
+      0)))

@@ -1,8 +1,8 @@
-; ADT fields cannot be str in MVP.
-;;! error_at: 5:16
+; ADT fields cannot be arrays.
+;;! error_at: 5:14
 ;;! error_contains: ADT field/payload type
 
-(struct Named [name: str])
+(struct Bad [xs: (Array i32 3)])
 
 (defn main [] -> i32
   0)

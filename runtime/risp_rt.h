@@ -27,6 +27,12 @@ int risp_str_len(RispString *s);
 /** Borrowed NUL-terminated pointer for printf/puts. */
 const char *risp_str_cstr(RispString *s);
 
+/** Allocate `size` bytes for a `Box` (aborts on OOM). */
+void *risp_box_alloc(size_t size);
+
+/** Free a box pointer; no-op when `p` is NULL. */
+void risp_box_free(void *p);
+
 #ifdef __cplusplus
 }
 #endif

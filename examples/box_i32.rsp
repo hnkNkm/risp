@@ -1,0 +1,9 @@
+; Unique heap Box: allocate, unbox (moves out and frees).
+;;! stdout: ok: box
+;;! exit: 0
+
+(defn main [] -> i32
+  (let [b: (Box i32) (box 42)]
+    (if (= (unbox b) 42)
+      (do (println "ok: box") 0)
+      (do (println "FAIL: box") 1))))

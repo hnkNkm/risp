@@ -9,7 +9,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType, StructType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -134,6 +134,17 @@ impl<'ctx> Codegen<'ctx> {
         self.fns.insert(
             "risp_str_cstr".into(),
             self.module.add_function("risp_str_cstr", cstr_ty, None),
+        );
+        let i64_ty = self.context.i64_type();
+        let box_alloc_ty = i8ptr_ty.fn_type(&[i64_ty.into()], false);
+        self.fns.insert(
+            "risp_box_alloc".into(),
+            self.module.add_function("risp_box_alloc", box_alloc_ty, None),
+        );
+        let box_free_ty = void_ty.fn_type(&[i8ptr_ty.into()], false);
+        self.fns.insert(
+            "risp_box_free".into(),
+            self.module.add_function("risp_box_free", box_free_ty, None),
         );
 
         // declare all user / extern / impl methods first (allow forward refs)
@@ -262,12 +273,14 @@ impl<'ctx> Codegen<'ctx> {
             Type::F32 => self.context.f32_type().into(),
             Type::F64 => self.context.f64_type().into(),
             Type::Bool => self.context.bool_type().into(),
-            Type::Str | Type::Array { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Str | Type::Array { .. } | Type::Box(_) => {
+                self.context.ptr_type(AddressSpace::default()).into()
+            }
             Type::Named(n) if self.structs.contains_key(n) => self.llvm_struct_ty(n).into(),
             Type::Named(n) if self.enums.contains_key(n) => self.llvm_enum_ty().into(),
             Type::Named(n) => panic!("unknown named type {n}"),
-            // MVP: Ref is typeck-only; same LLVM representation as the pointee.
-            Type::Ref(inner) => self.llvm_basic(inner),
+            // Shared borrow: LLVM pointer to the pointee.
+            Type::Ref(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Unit => panic!("unit has no basic type"),
         }
     }
@@ -376,9 +389,9 @@ impl<'ctx> Codegen<'ctx> {
                 let last = exprs.len() - 1;
                 for ex in &exprs[..last] {
                     let v = self.emit_expr(ex)?;
-                    if ex.ty.as_ref() == Some(&Type::Str) {
-                        if let Some(sv) = v {
-                            self.rt_str_release(sv.into_pointer_value())?;
+                    if let (Some(dty), Some(sv)) = (ex.ty.as_ref(), v) {
+                        if self.needs_drop(dty) {
+                            self.emit_drop(sv, dty)?;
                         }
                     }
                 }
@@ -401,9 +414,9 @@ impl<'ctx> Codegen<'ctx> {
         ret_val: Option<BasicValueEnum<'ctx>>,
         ret_ty: &Type,
     ) -> Result<(), CodegenError> {
-        // Drop local Rc strings before returning. The return value (if `str`) is
+        // Drop owned locals before returning. The return value (if needs_drop) is
         // a separately owned reference produced by `emit_expr`.
-        self.release_str_locals()?;
+        self.release_drop_locals()?;
         match (ret_ty, ret_val) {
             (Type::Unit, _) => {
                 self.builder
@@ -440,27 +453,20 @@ impl<'ctx> Codegen<'ctx> {
                 .ok_or_else(|| CodegenError::Internal("tco arg".into()))?;
             values.push(v);
         }
-        // Release non-parameter str locals before overwriting params / looping.
+        // Release non-parameter owned locals before overwriting params / looping.
         for (name, (ptr, ty)) in self.locals.clone() {
-            if ty == Type::Str && !self.param_locals.contains_key(&name) {
-                let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                let p = self
+            if self.needs_drop(&ty) && !self.param_locals.contains_key(&name) {
+                let bt = self.llvm_basic(&ty);
+                let old = self
                     .builder
-                    .build_load(ptr_ty, ptr, "tco.drop")
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
-                    .into_pointer_value();
-                self.rt_str_release(p)?;
+                    .build_load(bt, ptr, "tco.drop")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.emit_drop(old, &ty)?;
             }
         }
         for (name, v) in self.param_names.iter().zip(values) {
             let (ptr, ty) = self.param_locals[name].clone();
-            if ty == Type::Str {
-                self.store_str(ptr, v.into_pointer_value())?;
-            } else {
-                self.builder
-                    .build_store(ptr, v)
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-            }
+            self.store_owned(ptr, v, &ty)?;
         }
         self.locals = self.param_locals.clone();
         let loop_bb = self
@@ -491,12 +497,364 @@ impl<'ctx> Codegen<'ctx> {
             BasicTypeEnum::StructType(t) => tmp_builder.build_alloca(t, name).unwrap(),
             _ => panic!("unsupported alloca type"),
         };
-        // Rc strings start as null so release-before-store is safe.
-        if *ty == Type::Str {
-            let null = self.context.ptr_type(AddressSpace::default()).const_null();
-            tmp_builder.build_store(alloca, null).unwrap();
+        // Droppable slots start zeroed so release-before-store is safe.
+        if self.needs_drop(ty) {
+            tmp_builder
+                .build_store(alloca, self.zero_owned(ty))
+                .unwrap();
         }
         alloca
+    }
+
+    /// Types whose values own heap resources and must be dropped.
+    fn needs_drop(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Str | Type::Box(_) => true,
+            Type::Named(n) if self.structs.contains_key(n) => self.structs[n]
+                .fields
+                .iter()
+                .any(|f| self.needs_drop(&f.ty)),
+            Type::Named(n) if self.enums.contains_key(n) => self.enums[n]
+                .variants
+                .iter()
+                .any(|v| v.payload.as_ref().is_some_and(|p| self.needs_drop(p))),
+            _ => false,
+        }
+    }
+
+    fn zero_owned(&self, ty: &Type) -> BasicValueEnum<'ctx> {
+        match ty {
+            Type::Str | Type::Box(_) => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
+            Type::Named(n) if self.structs.contains_key(n) => {
+                self.llvm_struct_ty(n).const_zero().into()
+            }
+            Type::Named(n) if self.enums.contains_key(n) => self.llvm_enum_ty().const_zero().into(),
+            other => panic!("zero_owned on non-drop type {other}"),
+        }
+    }
+
+    fn emit_drop(&self, v: BasicValueEnum<'ctx>, ty: &Type) -> Result<(), CodegenError> {
+        match ty {
+            Type::Str => self.rt_str_release(v.into_pointer_value()),
+            Type::Box(inner) => self.emit_drop_box(v.into_pointer_value(), inner),
+            Type::Named(n) if self.structs.contains_key(n) => {
+                let sdef = self.structs[n].clone();
+                let sv = v.into_struct_value();
+                for (i, f) in sdef.fields.iter().enumerate() {
+                    if self.needs_drop(&f.ty) {
+                        let fv = self
+                            .builder
+                            .build_extract_value(sv, i as u32, &f.name)
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                        self.emit_drop(fv, &f.ty)?;
+                    }
+                }
+                Ok(())
+            }
+            Type::Named(n) if self.enums.contains_key(n) => {
+                self.emit_drop_enum(v.into_struct_value(), n)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn emit_drop_box(
+        &self,
+        p: PointerValue<'ctx>,
+        inner: &Type,
+    ) -> Result<(), CodegenError> {
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let nonnull_bb = self.context.append_basic_block(fv, "drop.box.body");
+        let merge_bb = self.context.append_basic_block(fv, "drop.box.end");
+        let is_null = self
+            .builder
+            .build_is_null(p, "box.isnull")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_null, merge_bb, nonnull_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(nonnull_bb);
+        let bt = self.llvm_basic(inner);
+        let inner_v = self
+            .builder
+            .build_load(bt, p, "box.inner")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        self.emit_drop(inner_v, inner)?;
+        let free_fn = self.fns["risp_box_free"];
+        self.builder
+            .build_call(free_fn, &[p.into()], "box.free")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        self.builder.position_at_end(merge_bb);
+        Ok(())
+    }
+
+    fn emit_drop_enum(
+        &self,
+        ev: inkwell::values::StructValue<'ctx>,
+        enum_name: &str,
+    ) -> Result<(), CodegenError> {
+        let edef = self.enums[enum_name].clone();
+        let drop_variants: Vec<_> = edef
+            .variants
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.payload.as_ref().is_some_and(|p| self.needs_drop(p)))
+            .map(|(i, v)| (i as u32, v.payload.clone().unwrap(), v.name.clone()))
+            .collect();
+        if drop_variants.is_empty() {
+            return Ok(());
+        }
+
+        let tag = self
+            .builder
+            .build_extract_value(ev, 0, "drop.tag")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+        let payload = self
+            .builder
+            .build_extract_value(ev, 1, "drop.payload")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let merge_bb = self.context.append_basic_block(fv, "drop.enum.end");
+        let else_bb = self.context.append_basic_block(fv, "drop.enum.skip");
+
+        let mut cases = Vec::with_capacity(drop_variants.len());
+        let mut arm_bbs = Vec::with_capacity(drop_variants.len());
+        for (tag_i, _, vname) in &drop_variants {
+            let bb = self
+                .context
+                .append_basic_block(fv, &format!("drop.enum.{vname}"));
+            let tag_c = self.context.i32_type().const_int(*tag_i as u64, false);
+            cases.push((tag_c, bb));
+            arm_bbs.push(bb);
+        }
+
+        self.builder
+            .build_switch(tag, else_bb, &cases)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        for ((_, pty, _), bb) in drop_variants.iter().zip(arm_bbs.into_iter()) {
+            self.builder.position_at_end(bb);
+            let unpacked = self.unpack_payload(payload, pty)?;
+            self.emit_drop(unpacked, pty)?;
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        }
+
+        self.builder.position_at_end(else_bb);
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        self.builder.position_at_end(merge_bb);
+        Ok(())
+    }
+
+    fn emit_retain(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match ty {
+            Type::Str => Ok(self.rt_str_retain(v.into_pointer_value())?.into()),
+            // Unique ownership: retain is a no-op (moves use load + null).
+            Type::Box(_) => Ok(v),
+            Type::Named(n) if self.structs.contains_key(n) => {
+                let sdef = self.structs[n].clone();
+                let mut agg = v.into_struct_value();
+                for (i, f) in sdef.fields.iter().enumerate() {
+                    if self.needs_drop(&f.ty) {
+                        let fv = self
+                            .builder
+                            .build_extract_value(agg, i as u32, &f.name)
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                        let retained = self.emit_retain(fv, &f.ty)?;
+                        agg = self
+                            .builder
+                            .build_insert_value(agg, retained, i as u32, &f.name)
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                            .into_struct_value();
+                    }
+                }
+                Ok(agg.into())
+            }
+            Type::Named(n) if self.enums.contains_key(n) => self.emit_retain_enum(v, n),
+            _ => Ok(v),
+        }
+    }
+
+    fn emit_retain_enum(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        enum_name: &str,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let edef = self.enums[enum_name].clone();
+        let retain_variants: Vec<_> = edef
+            .variants
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.payload.as_ref().is_some_and(|p| self.needs_drop(p)))
+            .map(|(i, v)| (i as u32, v.payload.clone().unwrap(), v.name.clone()))
+            .collect();
+        if retain_variants.is_empty() {
+            return Ok(v);
+        }
+
+        let ev = v.into_struct_value();
+        let tag = self
+            .builder
+            .build_extract_value(ev, 0, "retain.tag")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+        let payload = self
+            .builder
+            .build_extract_value(ev, 1, "retain.payload")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?
+            .into_int_value();
+
+        let fv = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let merge_bb = self.context.append_basic_block(fv, "retain.enum.end");
+        let else_bb = self.context.append_basic_block(fv, "retain.enum.skip");
+        let et = self.llvm_enum_ty();
+
+        let mut cases = Vec::with_capacity(retain_variants.len());
+        let mut arm_bbs = Vec::with_capacity(retain_variants.len());
+        for (tag_i, _, vname) in &retain_variants {
+            let bb = self
+                .context
+                .append_basic_block(fv, &format!("retain.enum.{vname}"));
+            let tag_c = self.context.i32_type().const_int(*tag_i as u64, false);
+            cases.push((tag_c, bb));
+            arm_bbs.push(bb);
+        }
+
+        self.builder
+            .build_switch(tag, else_bb, &cases)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+
+        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+        for ((_, pty, _), bb) in retain_variants.iter().zip(arm_bbs.into_iter()) {
+            self.builder.position_at_end(bb);
+            let unpacked = self.unpack_payload(payload, pty)?;
+            let retained = self.emit_retain(unpacked, pty)?;
+            let bits = self.pack_payload(retained, pty)?;
+            let mut agg = et.get_undef();
+            agg = self
+                .builder
+                .build_insert_value(agg, tag, 0, "tag")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into_struct_value();
+            agg = self
+                .builder
+                .build_insert_value(agg, bits, 1, "payload")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                .into_struct_value();
+            let end_bb = self.builder.get_insert_block().unwrap();
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            incoming.push((agg.into(), end_bb));
+        }
+
+        self.builder.position_at_end(else_bb);
+        let else_end = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        incoming.push((v, else_end));
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(et, "retain.enum")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        for (val, bb) in &incoming {
+            phi.add_incoming(&[(val, *bb)]);
+        }
+        Ok(phi.as_basic_value())
+    }
+
+    /// Store an owned value into an alloca, dropping the previous contents when needed.
+    fn store_owned(
+        &self,
+        alloca: PointerValue<'ctx>,
+        new_owned: BasicValueEnum<'ctx>,
+        ty: &Type,
+    ) -> Result<(), CodegenError> {
+        if self.needs_drop(ty) {
+            let bt = self.llvm_basic(ty);
+            let old = self
+                .builder
+                .build_load(bt, alloca, "old.owned")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            self.emit_drop(old, ty)?;
+        }
+        self.builder
+            .build_store(alloca, new_owned)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load from alloca and retain when the type owns heap data.
+    /// `Box` is unique: load moves out and nulls the source alloca.
+    fn load_owned(
+        &self,
+        alloca: PointerValue<'ctx>,
+        ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let bt = self.llvm_basic(ty);
+        let v = self
+            .builder
+            .build_load(bt, alloca, "load.owned")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        if matches!(ty, Type::Box(_)) {
+            self.builder
+                .build_store(alloca, self.zero_owned(ty))
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            return Ok(v);
+        }
+        self.emit_retain(v, ty)
+    }
+
+    /// Release all locals that need drop (function exit).
+    fn release_drop_locals(&self) -> Result<(), CodegenError> {
+        for (ptr, ty) in self.locals.values() {
+            if self.needs_drop(ty) {
+                let bt = self.llvm_basic(ty);
+                let v = self
+                    .builder
+                    .build_load(bt, *ptr, "drop.local")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                self.emit_drop(v, ty)?;
+            }
+        }
+        Ok(())
     }
 
     fn rt_call_ptr1(
@@ -532,52 +890,6 @@ impl<'ctx> Codegen<'ctx> {
         self.rt_call_ptr1("risp_str_from_cstr", cstr)
     }
 
-    /// Store an owned `str` into an alloca, releasing the previous value.
-    fn store_str(
-        &self,
-        alloca: PointerValue<'ctx>,
-        new_owned: PointerValue<'ctx>,
-    ) -> Result<(), CodegenError> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let old = self
-            .builder
-            .build_load(ptr_ty, alloca, "oldstr")
-            .map_err(|e| CodegenError::Llvm(e.to_string()))?
-            .into_pointer_value();
-        self.rt_str_release(old)?;
-        self.builder
-            .build_store(alloca, new_owned)
-            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Load `str` from alloca and retain (returns owned).
-    fn load_str_owned(&self, alloca: PointerValue<'ctx>) -> Result<PointerValue<'ctx>, CodegenError> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let p = self
-            .builder
-            .build_load(ptr_ty, alloca, "loadstr")
-            .map_err(|e| CodegenError::Llvm(e.to_string()))?
-            .into_pointer_value();
-        self.rt_str_retain(p)
-    }
-
-    /// Release all local `str` slots (function exit).
-    fn release_str_locals(&self) -> Result<(), CodegenError> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        for (ptr, ty) in self.locals.values() {
-            if *ty == Type::Str {
-                let p = self
-                    .builder
-                    .build_load(ptr_ty, *ptr, "dropstr")
-                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
-                    .into_pointer_value();
-                self.rt_str_release(p)?;
-            }
-        }
-        Ok(())
-    }
-
     fn expr_ty(e: &Expr) -> Result<&Type, CodegenError> {
         e.ty.as_ref()
             .ok_or_else(|| CodegenError::Internal("expression missing type info (typeck not run?)".into()))
@@ -598,8 +910,8 @@ impl<'ctx> Codegen<'ctx> {
                     // Array locals store the alloca address itself (no load).
                     if matches!(vty, Type::Array { .. }) {
                         Ok(Some(ptr.into()))
-                    } else if vty == Type::Str {
-                        Ok(Some(self.load_str_owned(ptr)?.into()))
+                    } else if self.needs_drop(&vty) {
+                        Ok(Some(self.load_owned(ptr, &vty)?))
                     } else {
                         let bt = self.llvm_basic(&vty);
                         let v = self
@@ -689,9 +1001,9 @@ impl<'ctx> Codegen<'ctx> {
                     prev.push(self.bind_local(fv, b)?);
                 }
                 let result = self.emit_expr(body)?;
-                // Drop this scope's str bindings when the body did not exit via break.
+                // Drop this scope's owned bindings when the body did not exit via break.
                 if !self.block_terminated() {
-                    self.release_let_str_bindings(bindings)?;
+                    self.release_let_drop_bindings(bindings)?;
                 }
                 for (name, p) in prev.into_iter().rev() {
                     match p {
@@ -717,9 +1029,9 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     let v = self.emit_expr(ex)?;
                     if i != last_i {
-                        if ex.ty.as_ref() == Some(&Type::Str) {
-                            if let Some(sv) = v {
-                                self.rt_str_release(sv.into_pointer_value())?;
+                        if let (Some(dty), Some(sv)) = (ex.ty.as_ref(), v) {
+                            if self.needs_drop(dty) {
+                                self.emit_drop(sv, dty)?;
                             }
                         }
                     } else {
@@ -748,12 +1060,8 @@ impl<'ctx> Codegen<'ctx> {
                     // Rebind the local to a new array pointer (no element-wise copy).
                     self.locals
                         .insert(name.clone(), (v.into_pointer_value(), vty));
-                } else if vty == Type::Str {
-                    self.store_str(ptr, v.into_pointer_value())?;
                 } else {
-                    self.builder
-                        .build_store(ptr, v)
-                        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                    self.store_owned(ptr, v, &vty)?;
                 }
                 Ok(None)
             }
@@ -778,16 +1086,83 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::ArrayLit { elem_ty, elems } => {
                 Ok(Some(self.emit_array_lit(elem_ty, elems)?.into()))
             }
+            ExprKind::BoxOf { expr } => Ok(Some(self.emit_box_of(expr)?)),
             ExprKind::Field { base, field } => Ok(Some(self.emit_field(base, field)?)),
             ExprKind::Match { scrutinee, arms } => self.emit_match(scrutinee, arms, &ty),
             ExprKind::Call { callee, args } => self.emit_call(callee, args, &ty),
         }
     }
 
+    fn emit_box_of(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let inner_ty = Self::expr_ty(expr)?.clone();
+        let v = self
+            .emit_expr(expr)?
+            .ok_or_else(|| CodegenError::Internal("box inner".into()))?;
+        let bt = self.llvm_basic(&inner_ty);
+        let size = bt
+            .size_of()
+            .ok_or_else(|| CodegenError::Internal("box size_of".into()))?;
+        let alloc_fn = self.fns["risp_box_alloc"];
+        let call = self
+            .builder
+            .build_call(alloc_fn, &[size.into()], "box.alloc")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let p = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Internal("box.alloc void".into()))?
+            .into_pointer_value();
+        self.builder
+            .build_store(p, v)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(p.into())
+    }
+
+    fn emit_unbox(&mut self, args: &[Expr]) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let box_ty = Self::expr_ty(&args[0])?.clone();
+        let Type::Box(inner) = box_ty else {
+            return Err(CodegenError::Internal("unbox non-box".into()));
+        };
+        let p = self
+            .emit_expr(&args[0])?
+            .ok_or_else(|| CodegenError::Internal("unbox arg".into()))?
+            .into_pointer_value();
+        let bt = self.llvm_basic(&inner);
+        let v = self
+            .builder
+            .build_load(bt, p, "unbox.val")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        // Move inner out; free the box shell without dropping the payload.
+        let free_fn = self.fns["risp_box_free"];
+        self.builder
+            .build_call(free_fn, &[p.into()], "unbox.free")
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        Ok(v)
+    }
+
+    /// `(borrow x)` — pointer to a local alloca (must be a `Var` place).
+    fn emit_borrow(
+        &self,
+        place: &Expr,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        let ExprKind::Var(name) = &place.kind else {
+            return Err(CodegenError::Internal(
+                "borrow requires a local variable place".into(),
+            ));
+        };
+        let (ptr, _) = self
+            .locals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CodegenError::Internal(format!("borrow unresolved {name}")))?;
+        Ok(Some(ptr.into()))
+    }
+
     fn emit_field(&mut self, base: &Expr, field: &str) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-        let base_ty = match Self::expr_ty(base)? {
-            Type::Ref(inner) => inner.as_ref().clone(),
-            other => other.clone(),
+        let raw_base_ty = Self::expr_ty(base)?.clone();
+        let (base_ty, via_ref) = match &raw_base_ty {
+            Type::Ref(inner) => (inner.as_ref().clone(), true),
+            other => (other.clone(), false),
         };
         let Type::Named(ref n) = base_ty else {
             return Err(CodegenError::Internal("field on non-struct".into()));
@@ -802,13 +1177,38 @@ impl<'ctx> Codegen<'ctx> {
             .iter()
             .position(|f| f.name == field)
             .ok_or_else(|| CodegenError::Internal(format!("no field {field}")))?;
-        let sv = self
+        let field_ty = sdef.fields[idx].ty.clone();
+        let base_v = self
             .emit_expr(base)?
-            .ok_or_else(|| CodegenError::Internal("field base".into()))?
-            .into_struct_value();
-        self.builder
-            .build_extract_value(sv, idx as u32, field)
-            .map_err(|e| CodegenError::Llvm(e.to_string()))
+            .ok_or_else(|| CodegenError::Internal("field base".into()))?;
+
+        let extracted = if via_ref {
+            let base_ptr = base_v.into_pointer_value();
+            let st = self.llvm_struct_ty(n);
+            let field_ptr = self
+                .builder
+                .build_struct_gep(st, base_ptr, idx as u32, field)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            let ft = self.llvm_basic(&field_ty);
+            self.builder
+                .build_load(ft, field_ptr, field)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+        } else {
+            self.builder
+                .build_extract_value(base_v.into_struct_value(), idx as u32, field)
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?
+        };
+
+        let result = if self.needs_drop(&field_ty) {
+            self.emit_retain(extracted, &field_ty)?
+        } else {
+            extracted
+        };
+        // Drop owned temporary base (not a borrow).
+        if !via_ref && self.needs_drop(&base_ty) {
+            self.emit_drop(base_v, &base_ty)?;
+        }
+        Ok(result)
     }
 
     fn emit_struct_lit(
@@ -889,6 +1289,10 @@ impl<'ctx> Codegen<'ctx> {
                     .build_int_z_extend(bits32, i64_ty, "f32zext")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?)
             }
+            Type::Str => Ok(self
+                .builder
+                .build_ptr_to_int(v.into_pointer_value(), i64_ty, "strpayload")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?),
             other => Err(CodegenError::Internal(format!(
                 "cannot pack payload type {other}"
             ))),
@@ -926,6 +1330,14 @@ impl<'ctx> Codegen<'ctx> {
                     .build_bit_cast(lo, self.context.f32_type(), "f32")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?)
             }
+            Type::Str => {
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                Ok(self
+                    .builder
+                    .build_int_to_ptr(bits, ptr_ty, "strunpack")
+                    .map_err(|e| CodegenError::Llvm(e.to_string()))?
+                    .into())
+            }
             other => Err(CodegenError::Internal(format!(
                 "cannot unpack payload type {other}"
             ))),
@@ -938,10 +1350,11 @@ impl<'ctx> Codegen<'ctx> {
         arms: &[MatchArm],
         result_ty: &Type,
     ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
-        let ev = self
+        let scrut_ty = Self::expr_ty(scrutinee)?.clone();
+        let ev_val = self
             .emit_expr(scrutinee)?
-            .ok_or_else(|| CodegenError::Internal("match scrutinee".into()))?
-            .into_struct_value();
+            .ok_or_else(|| CodegenError::Internal("match scrutinee".into()))?;
+        let ev = ev_val.into_struct_value();
         let tag = self
             .builder
             .build_extract_value(ev, 0, "mtag")
@@ -978,7 +1391,11 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(bb);
             let info = self.variants[&arm.variant].clone();
             let prev = if let (Some(pty), Some(bname)) = (&info.payload, &arm.binding) {
-                let unpacked = self.unpack_payload(payload, pty)?;
+                let mut unpacked = self.unpack_payload(payload, pty)?;
+                // Binding takes its own retain; enum temporary is dropped below.
+                if self.needs_drop(pty) {
+                    unpacked = self.emit_retain(unpacked, pty)?;
+                }
                 let alloca = self.create_entry_alloca(fv, bname, pty);
                 self.builder
                     .build_store(alloca, unpacked)
@@ -988,7 +1405,30 @@ impl<'ctx> Codegen<'ctx> {
                 None
             };
 
+            // Drop scrutinee temporary (releases payload unless retained into binding).
+            if self.needs_drop(&scrut_ty) {
+                self.emit_drop(ev_val, &scrut_ty)?;
+            }
+
             let body_v = self.emit_expr(&arm.body)?;
+
+            // Drop match binding before leaving the arm.
+            if let (Some(pty), Some(bname)) = (&info.payload, &arm.binding) {
+                if self.needs_drop(pty) && !self.block_terminated() {
+                    if let Some((ptr, _)) = self.locals.get(bname).cloned() {
+                        let bt = self.llvm_basic(pty);
+                        let bv = self
+                            .builder
+                            .build_load(bt, ptr, "match.drop.bind")
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                        self.emit_drop(bv, pty)?;
+                        self.builder
+                            .build_store(ptr, self.zero_owned(pty))
+                            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+                    }
+                }
+            }
+
             let end_bb = self.builder.get_insert_block().unwrap();
             let reached_merge = !self.block_terminated();
             if reached_merge {
@@ -1034,24 +1474,23 @@ impl<'ctx> Codegen<'ctx> {
         Ok(Some(phi.as_basic_value()))
     }
 
-    fn release_let_str_bindings(&self, bindings: &[Binding]) -> Result<(), CodegenError> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+    fn release_let_drop_bindings(&self, bindings: &[Binding]) -> Result<(), CodegenError> {
         for b in bindings.iter().rev() {
-            if b.ty != Type::Str {
+            if !self.needs_drop(&b.ty) {
                 continue;
             }
             let Some((ptr, _)) = self.locals.get(&b.name).cloned() else {
                 continue;
             };
-            let p = self
+            let bt = self.llvm_basic(&b.ty);
+            let v = self
                 .builder
-                .build_load(ptr_ty, ptr, "letscope.drop")
-                .map_err(|e| CodegenError::Llvm(e.to_string()))?
-                .into_pointer_value();
-            self.rt_str_release(p)?;
-            let null = ptr_ty.const_null();
+                .build_load(bt, ptr, "letscope.drop")
+                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            self.emit_drop(v, &b.ty)?;
+            // Zero the slot so a later function-exit drop is a no-op.
             self.builder
-                .build_store(ptr, null)
+                .build_store(ptr, self.zero_owned(&b.ty))
                 .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         }
         Ok(())
@@ -1068,15 +1507,9 @@ impl<'ctx> Codegen<'ctx> {
             .ok_or_else(|| CodegenError::Internal("let value".into()))?;
         let ptr = if matches!(b.ty, Type::Array { .. }) {
             v.into_pointer_value()
-        } else if b.ty == Type::Str {
-            let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
-            self.store_str(alloca, v.into_pointer_value())?;
-            alloca
         } else {
             let alloca = self.create_entry_alloca(fv, &b.name, &b.ty);
-            self.builder
-                .build_store(alloca, v)
-                .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            self.store_owned(alloca, v, &b.ty)?;
             alloca
         };
         Ok((
@@ -1371,8 +1804,8 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(None)
             }
             "alen" => Ok(Some(self.emit_alen(args)?.into())),
-            // MVP: borrow is identity at LLVM level (typeck-only Ref).
-            "borrow" => self.emit_expr(&args[0]),
+            "unbox" => Ok(Some(self.emit_unbox(args)?)),
+            "borrow" => self.emit_borrow(&args[0]),
             _ if self.structs.contains_key(callee) => {
                 Ok(Some(self.emit_struct_lit(callee, args)?))
             }
@@ -1409,7 +1842,7 @@ impl<'ctx> Codegen<'ctx> {
                     .build_call(fv, &argv, "calltmp")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
                 for p in owned_strs {
-                    self.rt_str_release(p)?;
+                    self.emit_drop(p.into(), &Type::Str)?;
                 }
                 if fn_ret_ty == Type::Unit {
                     Ok(None)
@@ -1584,12 +2017,12 @@ impl<'ctx> Codegen<'ctx> {
                     .build_call(printf, &[fmt.into(), cstr.into()], "printfcall")
                     .map_err(|e| CodegenError::Llvm(e.to_string()))?;
             }
-            self.rt_str_release(owned)?;
+            self.emit_drop(owned.into(), &Type::Str)?;
             return Ok(());
         }
 
         let printf = self.fns["__printf"];
-        let (fmt, arg_v): (&str, BasicMetadataValueEnum) = match ty {
+        let (fmt, arg_v): (&str, BasicMetadataValueEnum) = match &ty {
             Type::I32 => ("%d", v.into()),
             Type::I64 => ("%lld", v.into()),
             Type::F64 => ("%g", v.into()),
@@ -1610,7 +2043,12 @@ impl<'ctx> Codegen<'ctx> {
                 let ptr = selected.into_pointer_value();
                 ("%s", ptr.into())
             }
-            Type::Str | Type::Unit | Type::Array { .. } | Type::Named(_) | Type::Ref(_) => {
+            Type::Str
+            | Type::Unit
+            | Type::Array { .. }
+            | Type::Named(_)
+            | Type::Ref(_)
+            | Type::Box(_) => {
                 return Err(CodegenError::Internal("cannot print this type".into()));
             }
         };
@@ -1646,8 +2084,8 @@ impl<'ctx> Codegen<'ctx> {
             .basic()
             .ok_or_else(|| CodegenError::Internal("str-concat void".into()))?
             .into_pointer_value();
-        self.rt_str_release(a)?;
-        self.rt_str_release(b)?;
+        self.emit_drop(a.into(), &Type::Str)?;
+        self.emit_drop(b.into(), &Type::Str)?;
         Ok(out)
     }
 
@@ -1669,7 +2107,7 @@ impl<'ctx> Codegen<'ctx> {
             .basic()
             .ok_or_else(|| CodegenError::Internal("str-len void".into()))?
             .into_int_value();
-        self.rt_str_release(s)?;
+        self.emit_drop(s.into(), &Type::Str)?;
         Ok(n)
     }
 
