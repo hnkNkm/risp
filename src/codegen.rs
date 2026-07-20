@@ -298,10 +298,6 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
-    fn fn_type(&self, params: &[Type], ret: &Type) -> FunctionType<'ctx> {
-        self.fn_type_for_decl(params, ret, false)
-    }
-
     /// `extern_c`: `str` parameters/returns lower to `i8*` (C string).
     fn fn_type_for_decl(&self, params: &[Type], ret: &Type, extern_c: bool) -> FunctionType<'ctx> {
         let param_tys: Vec<BasicMetadataTypeEnum> = params
